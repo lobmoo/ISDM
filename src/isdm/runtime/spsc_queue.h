@@ -7,7 +7,8 @@
 
 namespace isdm {
 
-// Thin policy wrapper around the official Moodycamel SPSC queue.
+// Thin policy wrapper around the upstream ReaderWriterQueue (SPSC) pulled in
+// as a git submodule. Keeps the ISDM-facing API small and stable.
 template <typename T>
 class SpscQueue {
 public:
