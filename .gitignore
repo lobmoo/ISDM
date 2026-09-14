@@ -7,3 +7,6 @@ CMakeCache.txt
 Makefile
 .vscode/
 .clangd/
+
+# Third-party dependencies are fetched locally and are not versioned.
+thirdparty/
