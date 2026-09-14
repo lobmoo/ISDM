@@ -8,7 +8,19 @@
 
 #include "isdm/core/types.h"
 #include "isdm/node.h"
+#include "isdm/reflect.h"
 #include "isdm/transport/endpoint.h"
+
+// A struct registered via the reflection macro, for typed API tests.
+namespace typed_test {
+struct Motor {
+    std::uint32_t id;
+    float speed;
+};
+}  // namespace typed_test
+
+ISDM_STRUCT(typed_test::Motor, ISDM_FIELD(typed_test::Motor, id),
+            ISDM_FIELD(typed_test::Motor, speed))
 
 namespace isdm::test {
 namespace {
@@ -225,6 +237,36 @@ TEST(NodeSnapshotTest, SubscriberRecoversFullStateOnRequest) {
     ASSERT_TRUE(subscriber.request_snapshot(100));
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     EXPECT_EQ(received.load(), 3);
+}
+
+TEST(NodeTypedTest, PublishesAndReceivesTypedValue) {
+    const transport::Endpoint group(239, 255, 10, 12, 39306);
+
+    Node publisher(make_config(1, "publisher", group));
+    ASSERT_TRUE(publisher.register_type_typed<typed_test::Motor>(100));
+    ASSERT_TRUE(publisher.start());
+
+    Node subscriber(make_config(2, "subscriber", group));
+    ASSERT_TRUE(subscriber.start());
+
+    std::atomic<int> ok{0};
+    typed_test::Motor got{};
+    subscriber.subscribe_typed<typed_test::Motor>(
+        100, [&](ObjectId, const typed_test::Motor& m) {
+            got = m;
+            ++ok;
+        });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    ASSERT_NE(subscriber.registry().find(100), nullptr);
+
+    typed_test::Motor out{7, 1500.0f};
+    ASSERT_TRUE(publisher.publish_typed(1, 100, out));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    EXPECT_EQ(ok.load(), 1);
+    EXPECT_EQ(got.id, 7u);
+    EXPECT_FLOAT_EQ(got.speed, 1500.0f);
 }
 
 }  // namespace isdm::test

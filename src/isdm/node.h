@@ -5,11 +5,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -20,6 +22,7 @@
 #include "isdm/discovery/discovery_manager.h"
 #include "isdm/discovery/peer_table.h"
 #include "isdm/metrics.h"
+#include "isdm/reflect.h"
 #include "isdm/protocol/data_message.h"
 #include "isdm/protocol/batch_data_message.h"
 #include "isdm/protocol/frame.h"
@@ -78,6 +81,13 @@ public:
             advertised_fingerprints_.push_back(fp);
         }
         return true;
+    }
+
+    // Convenience: describe<T>() + register in one call.
+    template <typename T>
+    bool register_type_typed(TypeId type_id, Version version = 1) {
+        auto ref = describe<T>(type_id, version);
+        return register_type(ref.descriptor(), ref.name_table_size());
     }
 
     bool start() {
@@ -154,6 +164,15 @@ public:
         return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
     }
 
+    // Convenience: publish a trivially-copyable typed value (requires the type
+    // to be registered; e.g. via register_type_typed<T>(type_id)).
+    template <typename T>
+    bool publish_typed(ObjectId object_id, TypeId type_id, const T& value, Timestamp ts = 0) {
+        static_assert(std::is_trivially_copyable<T>::value,
+                      "publish_typed requires a trivially copyable type");
+        return publish(object_id, type_id, DataView(&value, sizeof(T)), ts);
+    }
+
     // Publishes many objects of one fixed-layout type in a single frame.
     // payloads is a flat buffer of count * payload_size bytes.
     bool publish_batch(const ObjectId* ids, const void* payloads, std::size_t count,
@@ -185,6 +204,23 @@ public:
     void subscribe(TypeId type_id, DataCallback cb) {
         std::lock_guard<std::mutex> lock(callback_mutex_);
         by_type_.emplace_back(type_id, std::move(cb));
+    }
+
+    // Convenience: subscribe with a typed callback. The payload is decoded into
+    // T when its size matches exactly; otherwise the callback is skipped.
+    template <typename T>
+    void subscribe_typed(TypeId type_id, std::function<void(ObjectId, const T&)> cb) {
+        static_assert(std::is_trivially_copyable<T>::value,
+                      "subscribe_typed requires a trivially copyable type");
+        subscribe(
+            type_id,
+            [cb = std::move(cb)](ObjectId object_id, TypeId, DataView payload, Timestamp) {
+                if (payload.size() == sizeof(T) && cb) {
+                    T value{};
+                    std::memcpy(&value, payload.data(), sizeof(T));
+                    cb(object_id, value);
+                }
+            });
     }
 
     void subscribe_object(ObjectId object_id, DataCallback cb) {
