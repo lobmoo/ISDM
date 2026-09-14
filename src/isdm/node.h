@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -34,6 +35,14 @@ struct NodeConfig {
     transport::Endpoint advertise_endpoint;   // multicast group for HELLO
     transport::Endpoint control_bind{0, 0, 0, 0, 0};
     transport::Endpoint data_bind{0, 0, 0, 0, 0};
+
+    // When threaded, start() spawns background control + data threads so the
+    // node is usable without a manual pump loop. Set false to drive it with
+    // pump() from your own thread (embedded use).
+    bool threaded = true;
+    std::chrono::milliseconds hello_interval{1000};
+    std::chrono::milliseconds peer_timeout{3000};
+    bool peer_offline_enabled = false;  // enable offline detection + callbacks
 };
 
 // Application-facing node: composes discovery, schema registry, and the
@@ -91,14 +100,23 @@ public:
         dm_config.schema_fingerprints = advertised_fingerprints_;
         dm_config.advertise_endpoint = config_.advertise_endpoint;
         dm_config.advertised_data_endpoint = data_->local_endpoint();
+        dm_config.peer_timeout = config_.peer_timeout;
         discovery_ = std::make_unique<DiscoveryManager>(control_.get(), std::move(dm_config));
 
         started_ = true;
+        if (config_.threaded) {
+            running_ = true;
+            control_thread_ = std::thread([this] { control_loop(); });
+            data_thread_ = std::thread([this] { data_loop(); });
+        }
         return true;
     }
 
     void stop() noexcept {
+        running_ = false;
         started_ = false;
+        if (control_thread_.joinable()) control_thread_.join();
+        if (data_thread_.joinable()) data_thread_.join();
         discovery_.reset();
         data_.reset();
         control_.reset();
@@ -145,16 +163,19 @@ public:
         by_object_.emplace_back(object_id, std::move(cb));
     }
 
-    // Drive discovery (advertise + poll control plane) and drain the data
-    // plane. Call periodically from your own thread.
+    using PeerStateCallback = std::function<void(NodeId, bool online)>;
+
+    void set_peer_state_callback(PeerStateCallback cb) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        peer_state_callback_ = std::move(cb);
+    }
+
+    // Drive discovery and data synchronously when config.threaded == false.
+    // In threaded mode the background loops own these paths and this method is
+    // intentionally a no-op to prevent two consumers reading one socket.
     void pump() {
-        if (!started_) return;
-        maybe_push_schemas();
-        if (discovery_ != nullptr) {
-            discovery_->advertise();
-            for (int i = 0; i < 4; ++i) discovery_->poll_once();
-        }
-        drain_data();
+        if (!started_ || config_.threaded) return;
+        pump_once();
     }
 
     void run_for(std::chrono::milliseconds duration) {
@@ -178,10 +199,18 @@ private:
     void maybe_push_schemas() {
         if (discovery_ == nullptr) return;
         std::vector<transport::Endpoint> targets;
+        PeerStateCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            cb = peer_state_callback_;
+        }
         discovery_->peers().for_each([&](const PeerInfo& peer) {
             if (!peer.online) return;
             const bool is_new = known_peers_.insert(peer.node_id).second;
-            if (is_new) targets.push_back(peer.endpoint);
+            if (is_new) {
+                targets.push_back(peer.endpoint);
+                if (cb) cb(peer.node_id, true);  // peer came online
+            }
         });
         for (const auto& endpoint : targets) {
             push_schemas_to(endpoint);
@@ -227,6 +256,64 @@ private:
         }
     }
 
+    // One full control + data iteration, used by pump() (single-threaded mode).
+    void pump_once() {
+        if (!started_) return;
+        maybe_push_schemas();
+        if (discovery_ != nullptr) {
+            discovery_->advertise();
+            for (int i = 0; i < 4; ++i) discovery_->poll_once();
+        }
+        drain_data();
+    }
+
+    // Background control thread: periodic HELLO, discovery polling, schema
+    // push, and optional offline detection.
+    void control_loop() {
+        // Advertise immediately on start, then throttle to hello_interval.
+        auto last_hello = std::chrono::steady_clock::now() - config_.hello_interval;
+        while (running_.load(std::memory_order_acquire)) {
+            maybe_push_schemas();
+            if (discovery_ != nullptr) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_hello >= config_.hello_interval) {
+                    discovery_->advertise();
+                    last_hello = now;
+                }
+                for (int i = 0; i < 4; ++i) discovery_->poll_once();
+            }
+            maybe_expire_peers();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    // Background data thread: drain incoming data/schema frames.
+    void data_loop() {
+        while (running_.load(std::memory_order_acquire)) {
+            drain_data();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    // Marks peers offline after their timeout and fires the state callback.
+    void maybe_expire_peers() {
+        if (!config_.peer_offline_enabled || discovery_ == nullptr) return;
+        std::vector<NodeId> offline;
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+        discovery_->peers().expire(std::chrono::milliseconds(now), &offline);
+        if (offline.empty()) return;
+        PeerStateCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callback_mutex_);
+            cb = peer_state_callback_;
+        }
+        if (cb) {
+            for (NodeId node_id : offline) cb(node_id, false);
+        }
+    }
+
     void handle_schema_response(DataView payload) {
         ByteReader reader(payload);
         protocol::SchemaResponse response;
@@ -264,6 +351,10 @@ private:
     std::vector<std::pair<ObjectId, DataCallback>> by_object_;
     std::unordered_set<NodeId> known_peers_;
     std::array<std::byte, kMaxFrame> recv_{};
+    PeerStateCallback peer_state_callback_;
+    std::thread control_thread_;
+    std::thread data_thread_;
+    std::atomic<bool> running_{false};
     bool started_ = false;
 };
 

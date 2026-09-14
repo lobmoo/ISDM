@@ -27,10 +27,11 @@ public:
         // Data-plane endpoint advertised in HELLO. If empty, the transport's
         // own local endpoint is reported instead.
         transport::Endpoint advertised_data_endpoint;
+        std::chrono::milliseconds peer_timeout{3000};
     };
 
     DiscoveryManager(transport::ITransport* transport, Config config)
-        : transport_(transport), config_(std::move(config)) {}
+        : transport_(transport), config_(std::move(config)), peers_(config_.peer_timeout) {}
 
     DiscoveryManager(const DiscoveryManager&) = delete;
     DiscoveryManager& operator=(const DiscoveryManager&) = delete;

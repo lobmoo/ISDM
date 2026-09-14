@@ -96,4 +96,67 @@ TEST(NodeIntegration, TwoNodesDiscoverSchemaSyncAndExchangeMotor) {
     EXPECT_FLOAT_EQ(latest.current, 20.5f);
 }
 
+TEST(NodeThreadedTest, OutOfBoxWithoutManualPump) {
+    const transport::Endpoint group(239, 255, 10, 8, 39302);
+    const MotorSchema motor = make_motor(100);
+
+    Node publisher(make_config(1, "publisher", group));
+    ASSERT_TRUE(publisher.register_type(motor.desc, sizeof(kMotorNames)));
+    ASSERT_TRUE(publisher.start());
+
+    Node subscriber(make_config(2, "subscriber", group));
+    ASSERT_TRUE(subscriber.start());
+
+    std::atomic<int> received{0};
+    subscriber.subscribe(
+        100, [&](ObjectId, TypeId, DataView payload, Timestamp) {
+            if (payload.size() == sizeof(Motor)) ++received;
+        });
+
+    // No manual pump(): background threads drive discovery + data receive.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_NE(subscriber.registry().find(100), nullptr);
+
+    const Motor out{1800.0f, 30.0f};
+    ASSERT_TRUE(publisher.publish(9001, 100, DataView(&out, sizeof(out))));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(received.load(), 1);
+}
+
+TEST(NodeThreadedTest, DetectsPeerOffline) {
+    const transport::Endpoint group(239, 255, 10, 9, 39303);
+
+    auto pub_config = make_config(1, "publisher", group);
+    pub_config.hello_interval = std::chrono::milliseconds(20);
+
+    auto sub_config = make_config(2, "subscriber", group);
+    sub_config.hello_interval = std::chrono::milliseconds(20);
+    sub_config.peer_timeout = std::chrono::milliseconds(60);
+    sub_config.peer_offline_enabled = true;
+
+    Node publisher(pub_config);
+    ASSERT_TRUE(publisher.start());
+    Node subscriber(sub_config);
+    ASSERT_TRUE(subscriber.start());
+
+    std::atomic<int> online{0};
+    std::atomic<int> offline{0};
+    subscriber.set_peer_state_callback([&](NodeId, bool is_online) {
+        if (is_online) ++online;
+        else ++offline;
+    });
+
+    for (int i = 0; i < 100 && online.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(online.load(), 1);
+
+    publisher.stop();  // publisher disappears
+
+    for (int i = 0; i < 100 && offline.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(offline.load(), 1);
+}
+
 }  // namespace isdm::test
