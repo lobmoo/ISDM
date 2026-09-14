@@ -18,6 +18,7 @@
 #include "isdm/core/types.h"
 #include "isdm/discovery/discovery_manager.h"
 #include "isdm/discovery/peer_table.h"
+#include "isdm/metrics.h"
 #include "isdm/protocol/data_message.h"
 #include "isdm/protocol/batch_data_message.h"
 #include "isdm/protocol/frame.h"
@@ -62,6 +63,7 @@ public:
 
     SchemaRegistry& registry() noexcept { return registry_; }
     const SchemaRegistry& registry() const noexcept { return registry_; }
+    Metrics& metrics() noexcept { return metrics_; }
 
     bool register_type(const TypeDescriptor& desc, std::size_t name_table_size) {
         if (!registry_.register_type(desc, name_table_size)) return false;
@@ -167,7 +169,7 @@ public:
         ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
         if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer))
             return false;
-
+        metrics_.tx_batches++;
         return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
     }
 
@@ -262,9 +264,14 @@ private:
             const std::size_t size = data_->receive_from(
                 MutableDataView(recv_.data(), recv_.size()), source);
             if (size == 0) break;
+            metrics_.rx_frames++;
+            metrics_.rx_bytes += size;
 
             protocol::Frame frame;
-            if (!parse_frame(DataView(recv_.data(), size), frame)) continue;
+            if (!parse_frame(DataView(recv_.data(), size), frame)) {
+                metrics_.rx_dropped++;
+                continue;
+            }
 
             if (frame.header.message_type == protocol::MessageType::kSchema) {
                 handle_schema_response(frame.payload);
@@ -276,6 +283,8 @@ private:
 
     // Sends a fully-framed message to all online peers; true if any send landed.
     bool send_frame_to_peers(DataView frame) {
+        metrics_.tx_frames++;
+        metrics_.tx_bytes += frame.size();
         bool sent = false;
         discovery_->peers().for_each([&](const PeerInfo& peer) {
             if (peer.online) {
@@ -292,6 +301,7 @@ private:
             payload.read_at<std::uint16_t>(0) == protocol::kBatchDataMagic) {
             protocol::BatchDataMessage message;
             if (!decode_batch_data(payload, message)) return;
+            metrics_.rx_objects += message.count();
             for (std::size_t i = 0; i < message.count(); ++i) {
                 dispatch(message.object_id(i), message.type_id, message.payload(i),
                          message.timestamp);
@@ -299,6 +309,7 @@ private:
         } else {
             protocol::DataMessage message;
             if (!decode_data_message(payload, message)) return;
+            metrics_.rx_objects++;
             dispatch(message.object_id, message.type_id, message.payload, message.timestamp);
         }
     }
@@ -365,7 +376,9 @@ private:
         ByteReader reader(payload);
         protocol::SchemaResponse response;
         if (!decode_schema_response(reader, response)) return;
-        registry().register_type(response.descriptor(), response.name_table_size());
+        if (registry().register_type(response.descriptor(), response.name_table_size())) {
+            metrics_.rx_schema_updates++;
+        }
     }
 
     void dispatch(ObjectId object_id, TypeId type_id, DataView payload, Timestamp timestamp) {
@@ -399,6 +412,7 @@ private:
     std::thread control_thread_;
     std::thread data_thread_;
     std::atomic<bool> running_{false};
+    Metrics metrics_;
     bool started_ = false;
 };
 
