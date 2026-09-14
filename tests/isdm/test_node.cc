@@ -159,4 +159,32 @@ TEST(NodeThreadedTest, DetectsPeerOffline) {
     EXPECT_EQ(offline.load(), 1);
 }
 
+TEST(NodeBatchTest, PublisherSendsBatchSubscriberReceivesAll) {
+    const transport::Endpoint group(239, 255, 10, 10, 39304);
+    const MotorSchema motor = make_motor(100);
+
+    Node publisher(make_config(1, "publisher", group));
+    ASSERT_TRUE(publisher.register_type(motor.desc, sizeof(kMotorNames)));
+    ASSERT_TRUE(publisher.start());
+
+    Node subscriber(make_config(2, "subscriber", group));
+    ASSERT_TRUE(subscriber.start());
+
+    std::atomic<int> received{0};
+    subscriber.subscribe(
+        100, [&](ObjectId, TypeId, DataView payload, Timestamp) {
+            if (payload.size() == sizeof(Motor)) ++received;
+        });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    ASSERT_NE(subscriber.registry().find(100), nullptr);
+
+    const ObjectId ids[3] = {1, 2, 3};
+    Motor motors[3] = {{100.0f, 10.0f}, {200.0f, 20.0f}, {300.0f, 30.0f}};
+    ASSERT_TRUE(publisher.publish_batch(ids, motors, 3, 100, sizeof(Motor)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    EXPECT_EQ(received.load(), 3);
+}
+
 }  // namespace isdm::test

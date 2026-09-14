@@ -19,6 +19,7 @@
 #include "isdm/discovery/discovery_manager.h"
 #include "isdm/discovery/peer_table.h"
 #include "isdm/protocol/data_message.h"
+#include "isdm/protocol/batch_data_message.h"
 #include "isdm/protocol/frame.h"
 #include "isdm/protocol/header.h"
 #include "isdm/protocol/schema_sync.h"
@@ -143,14 +144,31 @@ public:
         if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer))
             return false;
 
-        const auto frame_view = DataView(frame_storage, frame_writer.offset());
-        bool sent = false;
-        discovery_->peers().for_each([&](const PeerInfo& peer) {
-            if (peer.online) {
-                if (data_->send_to(frame_view, peer.endpoint) != 0) sent = true;
-            }
-        });
-        return sent;
+        return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
+    }
+
+    // Publishes many objects of one fixed-layout type in a single frame.
+    // payloads is a flat buffer of count * payload_size bytes.
+    bool publish_batch(const ObjectId* ids, const void* payloads, std::size_t count,
+                       TypeId type_id, std::size_t payload_size, Timestamp ts = 0) {
+        if (!started_ || ids == nullptr || payloads == nullptr || count == 0) return false;
+
+        std::byte payload_storage[kMaxFrame];
+        ByteWriter data_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!protocol::encode_batch_data(ids, static_cast<const std::byte*>(payloads), count,
+                                         type_id, ts == 0 ? now_ns() : ts, payload_size,
+                                         data_writer)) {
+            return false;
+        }
+
+        protocol::Header header;
+        header.message_type = protocol::MessageType::kData;
+        std::byte frame_storage[kMaxFrame];
+        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+        if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer))
+            return false;
+
+        return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
     }
 
     void subscribe(TypeId type_id, DataCallback cb) {
@@ -251,8 +269,37 @@ private:
             if (frame.header.message_type == protocol::MessageType::kSchema) {
                 handle_schema_response(frame.payload);
             } else if (frame.header.message_type == protocol::MessageType::kData) {
-                handle_data_message(frame.payload);
+                handle_data_payload(frame.payload);
             }
+        }
+    }
+
+    // Sends a fully-framed message to all online peers; true if any send landed.
+    bool send_frame_to_peers(DataView frame) {
+        bool sent = false;
+        discovery_->peers().for_each([&](const PeerInfo& peer) {
+            if (peer.online) {
+                if (data_->send_to(frame, peer.endpoint) != 0) sent = true;
+            }
+        });
+        return sent;
+    }
+
+    // Distinguishes a batch data frame from a single-object data frame and
+    // dispatches every contained object to the matching callbacks.
+    void handle_data_payload(DataView payload) {
+        if (payload.size() >= 2 &&
+            payload.read_at<std::uint16_t>(0) == protocol::kBatchDataMagic) {
+            protocol::BatchDataMessage message;
+            if (!decode_batch_data(payload, message)) return;
+            for (std::size_t i = 0; i < message.count(); ++i) {
+                dispatch(message.object_id(i), message.type_id, message.payload(i),
+                         message.timestamp);
+            }
+        } else {
+            protocol::DataMessage message;
+            if (!decode_data_message(payload, message)) return;
+            dispatch(message.object_id, message.type_id, message.payload, message.timestamp);
         }
     }
 
@@ -321,22 +368,19 @@ private:
         registry().register_type(response.descriptor(), response.name_table_size());
     }
 
-    void handle_data_message(DataView payload) {
-        protocol::DataMessage message;
-        if (!decode_data_message(payload, message)) return;
-
+    void dispatch(ObjectId object_id, TypeId type_id, DataView payload, Timestamp timestamp) {
         std::vector<DataCallback> callbacks;
         {
             std::lock_guard<std::mutex> lock(callback_mutex_);
             for (auto& [oid, cb] : by_object_) {
-                if (oid == message.object_id) callbacks.push_back(cb);
+                if (oid == object_id) callbacks.push_back(cb);
             }
             for (auto& [tid, cb] : by_type_) {
-                if (tid == message.type_id) callbacks.push_back(cb);
+                if (tid == type_id) callbacks.push_back(cb);
             }
         }
         for (auto& cb : callbacks) {
-            cb(message.object_id, message.type_id, message.payload, message.timestamp);
+            cb(object_id, type_id, payload, timestamp);
         }
     }
 

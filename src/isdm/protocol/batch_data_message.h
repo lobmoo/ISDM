@@ -1,0 +1,89 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+
+#include "isdm/codec/codec.h"
+#include "isdm/core/data_view.h"
+#include "isdm/core/types.h"
+
+namespace isdm::protocol {
+
+constexpr std::uint16_t kBatchDataMagic = 0x4244;  // "BD"
+constexpr std::size_t kBatchDataHeaderSize = 22;   // magic2+type4+ts8+count4+size4
+
+// One frame carrying many objects of a single fixed-layout type. The per-object
+// header (type_id/timestamp/magic) is hoisted into a single batch header, so
+// the wire cost per object is just object_id + payload.
+//
+// Layout:
+//   magic u16 | type_id u32 | timestamp u64 | count u32 | payload_size u32
+//   then count x (object_id u64 + payload[payload_size])
+struct BatchDataMessage {
+    TypeId type_id = 0;
+    Timestamp timestamp = 0;
+    std::size_t payload_size = 0;
+    DataView entries;  // zero-copy into the frame: (oid+payload)*count
+
+    std::size_t stride() const noexcept { return sizeof(ObjectId) + payload_size; }
+
+    std::size_t count() const noexcept {
+        const std::size_t s = stride();
+        return s == 0 ? 0 : entries.size() / s;
+    }
+
+    ObjectId object_id(std::size_t index) const noexcept {
+        return entries.read_at<ObjectId>(index * stride());
+    }
+
+    DataView payload(std::size_t index) const noexcept {
+        return entries.sub_view(index * stride() + sizeof(ObjectId), payload_size);
+    }
+};
+
+inline bool encode_batch_data(const ObjectId* ids, const std::byte* payloads, std::size_t count,
+                              TypeId type_id, Timestamp timestamp, std::size_t payload_size,
+                              ByteWriter& out) noexcept {
+    if (payload_size > std::numeric_limits<std::uint32_t>::max() ||
+        count > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    const auto count32 = static_cast<std::uint32_t>(count);
+
+    if (!out.write(kBatchDataMagic) || !out.write(type_id) || !out.write(timestamp) ||
+        !out.write(count32) || !out.write(static_cast<std::uint32_t>(payload_size))) {
+        return false;
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!out.write(ids[i])) return false;
+        if (payload_size != 0 && !out.write_bytes(payloads + i * payload_size, payload_size)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool decode_batch_data(DataView message, BatchDataMessage& out) noexcept {
+    if (message.size() < kBatchDataHeaderSize) return false;
+
+    ByteReader reader(message);
+    std::uint16_t magic = 0;
+    std::uint32_t count = 0;
+    std::uint32_t payload_size = 0;
+    if (!reader.read(magic) || !reader.read(out.type_id) || !reader.read(out.timestamp) ||
+        !reader.read(count) || !reader.read(payload_size)) {
+        return false;
+    }
+    if (magic != kBatchDataMagic) return false;
+
+    out.payload_size = payload_size;
+    const std::size_t stride = sizeof(ObjectId) + payload_size;
+    const std::size_t body = static_cast<std::size_t>(count) * stride;
+    if (body != 0 && body > message.size() - kBatchDataHeaderSize) return false;
+
+    out.entries = message.sub_view(kBatchDataHeaderSize, body);
+    return true;
+}
+
+}  // namespace isdm::protocol
