@@ -187,4 +187,44 @@ TEST(NodeBatchTest, PublisherSendsBatchSubscriberReceivesAll) {
     EXPECT_EQ(received.load(), 3);
 }
 
+TEST(NodeSnapshotTest, SubscriberRecoversFullStateOnRequest) {
+    const transport::Endpoint group(239, 255, 10, 11, 39305);
+    const MotorSchema motor = make_motor(100);
+
+    Node publisher(make_config(1, "publisher", group));
+    ASSERT_TRUE(publisher.register_type(motor.desc, sizeof(kMotorNames)));
+    ASSERT_TRUE(publisher.start());
+
+    Node subscriber(make_config(2, "subscriber", group));
+    ASSERT_TRUE(subscriber.start());
+
+    std::atomic<int> received{0};
+    subscriber.subscribe(
+        100, [&](ObjectId, TypeId, DataView payload, Timestamp) {
+            if (payload.size() == sizeof(Motor)) ++received;
+        });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    ASSERT_NE(subscriber.registry().find(100), nullptr);
+
+    const ObjectId ids[3] = {1, 2, 3};
+    Motor motors[3] = {{100.0f, 10.0f}, {200.0f, 20.0f}, {300.0f, 30.0f}};
+    ASSERT_TRUE(publisher.publish_batch(ids, motors, 3, 100, sizeof(Motor)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ASSERT_EQ(received.load(), 3);
+
+    // A late/re-joining subscriber asks for the retained state and recovers
+    // the full set without the publisher publishing again.
+    // Ensure the subscriber has registered the publisher as a known peer.
+    for (int i = 0; i < 200 && subscriber.peers().size() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_GT(subscriber.peers().size(), 0U);
+
+    received = 0;
+    ASSERT_TRUE(subscriber.request_snapshot(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(received.load(), 3);
+}
+
 }  // namespace isdm::test

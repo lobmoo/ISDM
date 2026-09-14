@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -24,6 +25,7 @@
 #include "isdm/protocol/frame.h"
 #include "isdm/protocol/header.h"
 #include "isdm/protocol/schema_sync.h"
+#include "isdm/protocol/snapshot.h"
 #include "isdm/schema/schema_registry.h"
 #include "isdm/transport/transport.h"
 #include "isdm/transport/udp_transport.h"
@@ -64,6 +66,7 @@ public:
     SchemaRegistry& registry() noexcept { return registry_; }
     const SchemaRegistry& registry() const noexcept { return registry_; }
     Metrics& metrics() noexcept { return metrics_; }
+    const PeerTable& peers() const noexcept { return discovery_ == nullptr ? empty_peers_ : discovery_->peers(); }
 
     bool register_type(const TypeDescriptor& desc, std::size_t name_table_size) {
         if (!registry_.register_type(desc, name_table_size)) return false;
@@ -146,6 +149,8 @@ public:
         if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer))
             return false;
 
+        retain(message.object_id, message.type_id, data.data(), data.size(),
+               message.timestamp);
         return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
     }
 
@@ -169,6 +174,10 @@ public:
         ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
         if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer))
             return false;
+        for (std::size_t i = 0; i < count; ++i) {
+            retain(ids[i], type_id,
+                   static_cast<const std::byte*>(payloads) + i * payload_size, payload_size, ts);
+        }
         metrics_.tx_batches++;
         return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
     }
@@ -188,6 +197,24 @@ public:
     void set_peer_state_callback(PeerStateCallback cb) {
         std::lock_guard<std::mutex> lock(callback_mutex_);
         peer_state_callback_ = std::move(cb);
+    }
+
+    // Asks all online peers to send their full retained state for a type.
+    bool request_snapshot(TypeId type_id) {
+        if (!started_) return false;
+        std::byte payload_storage[32];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        protocol::SnapshotRequest request;
+        request.type_id = type_id;
+        if (!protocol::encode_snapshot_request(request, writer)) return false;
+
+        protocol::Header header;
+        header.message_type = protocol::MessageType::kSnapshotRequest;
+        std::byte frame_storage[kMaxFrame];
+        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+        if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer))
+            return false;
+        return send_frame_to_known_peers(DataView(frame_storage, frame_writer.offset()));
     }
 
     // Drive discovery and data synchronously when config.threaded == false.
@@ -277,6 +304,8 @@ private:
                 handle_schema_response(frame.payload);
             } else if (frame.header.message_type == protocol::MessageType::kData) {
                 handle_data_payload(frame.payload);
+            } else if (frame.header.message_type == protocol::MessageType::kSnapshotRequest) {
+                handle_snapshot_request(frame.payload, source);
             }
         }
     }
@@ -290,6 +319,17 @@ private:
             if (peer.online) {
                 if (data_->send_to(frame, peer.endpoint) != 0) sent = true;
             }
+        });
+        return sent;
+    }
+
+    // Sends to every known peer regardless of online state (control actions).
+    bool send_frame_to_known_peers(DataView frame) {
+        metrics_.tx_frames++;
+        metrics_.tx_bytes += frame.size();
+        bool sent = false;
+        discovery_->peers().for_each([&](const PeerInfo& peer) {
+            if (data_->send_to(frame, peer.endpoint) != 0) sent = true;
         });
         return sent;
     }
@@ -381,6 +421,60 @@ private:
         }
     }
 
+    // Remembers the latest payload for an object so a (re)connecting peer can
+    // recover its full state via a snapshot request.
+    void retain(ObjectId object_id, TypeId type_id, const void* data, std::size_t size,
+                Timestamp timestamp) {
+        std::vector<std::byte> copy(static_cast<const std::byte*>(data),
+                                    static_cast<const std::byte*>(data) + size);
+        std::lock_guard<std::mutex> lock(retained_mutex_);
+        auto& objects = retained_[type_id];
+        for (auto& entry : objects) {
+            if (entry.object_id == object_id) {
+                entry.payload = std::move(copy);
+                entry.timestamp = timestamp;
+                return;
+            }
+        }
+        objects.push_back(RetainedObject{object_id, std::move(copy), timestamp});
+    }
+
+    void handle_snapshot_request(DataView payload, const transport::Endpoint& source) {
+        ByteReader reader(payload);
+        protocol::SnapshotRequest request;
+        if (!decode_snapshot_request(reader, request)) return;
+        reply_snapshot(request.type_id, source);
+    }
+
+    // Replies to a snapshot request by sending each retained object of the type
+    // as a single data frame to the requester.
+    void reply_snapshot(TypeId type_id, const transport::Endpoint& dest) {
+        std::vector<RetainedObject> objects;
+        {
+            std::lock_guard<std::mutex> lock(retained_mutex_);
+            const auto it = retained_.find(type_id);
+            if (it != retained_.end()) objects = it->second;
+        }
+        for (const auto& object : objects) {
+            protocol::DataMessage message;
+            message.object_id = object.object_id;
+            message.type_id = type_id;
+            message.timestamp = object.timestamp;
+            message.payload = DataView(object.payload.data(), object.payload.size());
+
+            std::byte payload_storage[kMaxFrame];
+            ByteWriter data_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+            if (!encode_data_message(message, data_writer)) continue;
+
+            protocol::Header header;
+            header.message_type = protocol::MessageType::kData;
+            std::byte frame_storage[kMaxFrame];
+            ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+            if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer)) continue;
+            data_->send_to(DataView(frame_storage, frame_writer.offset()), dest);
+        }
+    }
+
     void dispatch(ObjectId object_id, TypeId type_id, DataView payload, Timestamp timestamp) {
         std::vector<DataCallback> callbacks;
         {
@@ -403,6 +497,7 @@ private:
     std::unique_ptr<transport::UdpTransport> control_;
     std::unique_ptr<transport::UdpTransport> data_;
     std::unique_ptr<DiscoveryManager> discovery_;
+    PeerTable empty_peers_;
     std::mutex callback_mutex_;
     std::vector<std::pair<TypeId, DataCallback>> by_type_;
     std::vector<std::pair<ObjectId, DataCallback>> by_object_;
@@ -413,6 +508,13 @@ private:
     std::thread data_thread_;
     std::atomic<bool> running_{false};
     Metrics metrics_;
+    struct RetainedObject {
+        ObjectId object_id;
+        std::vector<std::byte> payload;
+        Timestamp timestamp;
+    };
+    std::mutex retained_mutex_;
+    std::unordered_map<TypeId, std::vector<RetainedObject>> retained_;
     bool started_ = false;
 };
 

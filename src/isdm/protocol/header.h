@@ -23,6 +23,7 @@ enum class MessageType : std::uint8_t {
     kData = 10,
     kSnapshot = 11,
     kDelta = 12,
+    kSnapshotRequest = 13,
     kHeartbeat = 20,
     kControl = 30,
     kAck = 31,
