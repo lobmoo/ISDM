@@ -7,3 +7,14 @@ add_executable(isdm_demo_pub_sub
 target_link_libraries(isdm_demo_pub_sub PRIVATE ISDM::core)
 target_compile_features(isdm_demo_pub_sub PRIVATE cxx_std_17)
 target_compile_options(isdm_demo_pub_sub PRIVATE -Wall -Wextra -Wpedantic)
+
+# Two-process demo: independent publisher and subscriber executables.
+add_executable(isdm_publisher two_process/publisher.cc)
+target_link_libraries(isdm_publisher PRIVATE ISDM::core)
+target_compile_features(isdm_publisher PRIVATE cxx_std_17)
+target_compile_options(isdm_publisher PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(isdm_subscriber two_process/subscriber.cc)
+target_link_libraries(isdm_subscriber PRIVATE ISDM::core)
+target_compile_features(isdm_subscriber PRIVATE cxx_std_17)
+target_compile_options(isdm_subscriber PRIVATE -Wall -Wextra -Wpedantic)
