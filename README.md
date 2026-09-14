@@ -29,22 +29,26 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/your-org/ISDM.git
+git clone <your-repo>.git ISDM
 cd ISDM
 
-# 初始化第三方库
+# 获取 readerwriterqueue 子模块
 git submodule update --init --recursive
 
-# 编译
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+# 编译、测试
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DISDM_BUILD_TESTS=ON \
+  -DISDM_BUILD_EXAMPLES=ON \
+  -DISDM_BUILD_BENCHMARKS=OFF
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure
 
-# 运行测试
-ctest --output-on-failure
+# 运行端到端 Demo
+./build/examples/isdm_demo_pub_sub
 
-# 安装
-sudo make install
+# 安装（可选）
+cmake --install build
 ```
 
 ### 示例代码
@@ -70,39 +74,63 @@ ISDM_STRUCT(Motor,
 )
 ```
 
-**发布数据：**
+**定义数据结构（编译期自动生成 Schema）：**
 
 ```cpp
-#include "isdm/node.h"
+#include "isdm/isdm.h"
 
+namespace app {
+struct Motor {
+  std::uint32_t id;
+  float speed;
+  float current;
+};
+}
+ISDM_STRUCT(app::Motor,
+  ISDM_FIELD(app::Motor, id),
+  ISDM_FIELD(app::Motor, speed),
+  ISDM_FIELD(app::Motor, current))
+```
+
+**发布数据（线程驱动，开盒即用）：**
+
+```cpp
 int main() {
-  isdm::Node node("publisher");
-  auto publisher = node.CreatePublisher<Motor>();
-  
-  Motor motor{1500.0f, 20.5f, 380.0f, 1};
-  publisher->Publish(motor);
-  
-  return 0;
+  isdm::NodeConfig cfg;
+  cfg.node_id = 1;
+  cfg.node_name = "publisher";
+  cfg.advertise_endpoint = isdm::Endpoint(239, 255, 20, 99, 39999);
+  cfg.control_bind = isdm::Endpoint(0, 0, 0, 0, 39999);
+  cfg.data_bind = isdm::Endpoint(127, 0, 0, 1, 0);
+
+  isdm::Node node(cfg);
+  auto ref = isdm::describe<app::Motor>(100, 1);
+  node.register_type(ref.descriptor(), ref.name_table_size());
+  node.start();
+
+  app::Motor motor{1, 1500.0f, 20.5f};
+  node.publish(1, 100, isdm::DataView(&motor, sizeof(motor)));
 }
 ```
 
-**订阅数据：**
+**订阅数据（无预知结构，Schema 驱动解码）：**
 
 ```cpp
-#include "isdm/node.h"
-
 int main() {
-  isdm::Node node("subscriber");
-  
-  auto subscriber = node.CreateSubscriber<Motor>(
-      [](const Motor& motor) {
-        printf("Received: speed=%.1f current=%.1f\n", 
-               motor.speed, motor.current);
-      });
-  
-  // 等待数据
+  isdm::NodeConfig sub_cfg;
+  sub_cfg.node_id = 2;
+  sub_cfg.node_name = "subscriber";
+  sub_cfg.advertise_endpoint = isdm::Endpoint(239, 255, 20, 99, 39999);
+  sub_cfg.control_bind = isdm::Endpoint(0, 0, 0, 0, 39999);
+  sub_cfg.data_bind = isdm::Endpoint(127, 0, 0, 1, 0);
+
+  isdm::Node node(sub_cfg);
+  node.start();
+  node.subscribe(100, [](isdm::ObjectId, isdm::TypeId tid,
+                         isdm::DataView payload, isdm::Timestamp) {
+    // 用自动同步来的 Schema 逐字段解码 payload
+  });
   std::this_thread::sleep_for(std::chrono::seconds(10));
-  return 0;
 }
 ```
 

@@ -188,5 +188,17 @@ int main() {
 
     std::printf("\n== summary ==\n");
     std::printf("received=%d\n", received.load());
+    const auto pm = publisher.metrics().snapshot();
+    const auto sm = subscriber.metrics().snapshot();
+    std::printf("publisher tx_frames=%llu tx_bytes=%llu tx_batches=%llu\n",
+                static_cast<unsigned long long>(pm.tx_frames),
+                static_cast<unsigned long long>(pm.tx_bytes),
+                static_cast<unsigned long long>(pm.tx_batches));
+    std::printf("subscriber rx_frames=%llu rx_objects=%llu rx_schema_updates=%llu "
+                "rx_dropped=%llu\n",
+                static_cast<unsigned long long>(sm.rx_frames),
+                static_cast<unsigned long long>(sm.rx_objects),
+                static_cast<unsigned long long>(sm.rx_schema_updates),
+                static_cast<unsigned long long>(sm.rx_dropped));
     return received.load() > 0 ? 0 : 1;
 }

@@ -1,258 +1,157 @@
-# 🚀 ISDM 快速上手指南
+# ISDM 快速上手指南
 
-## 第一次使用？从这里开始！
+> 高密度、自描述工业通信中间件。本指南对应仓库当前真实代码与 API。
 
-### 1️⃣ 运行初始化脚本 (5分钟)
+## 1. 依赖
+
+- C++17 编译器（GCC 9+ / Clang 10+）
+- CMake 3.16+
+- Linux（本项目基于 POSIX socket / 组播）
+
+## 2. 克隆与获取第三方依赖
 
 ```bash
-cd /home/wwk/workspace/ISDM
-chmod +x setup.sh
-./setup.sh
+git clone <your-repo>.git ISDM
+cd ISDM
+
+# 拉取 readerwriterqueue 子模块（项目使用的唯一第三方 header-only 队列）
+git submodule update --init --recursive
 ```
 
-这会自动完成：
-- ✅ 检查依赖
-- ✅ 下载第三方库
-- ✅ 创建目录结构
-- ✅ 编译项目
-- ✅ 运行测试
+`thirdparty/` 里的子模块内容不纳入仓库源码，由 submodule 按上游固定 commit 拉取。
 
-### 2️⃣ 阅读关键文档 (30分钟)
+## 3. 编译
 
-**必读：**
 ```bash
-# 1. 项目总览
-cat PROJECT_SUMMARY.md | less
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DISDM_BUILD_TESTS=ON \
+  -DISDM_BUILD_EXAMPLES=ON \
+  -DISDM_BUILD_BENCHMARKS=OFF
 
-# 2. 架构设计
-cat doc/架构设计与开发计划.md | less
-
-# 3. 开发路线
-cat ROADMAP.md | less
+cmake --build build -j$(nproc)
 ```
 
-**选读：**
+产物：
+
+- 核心静态库：`build/src/libisdm_core.a`
+- 端到端 Demo：`build/examples/isdm_demo_pub_sub`
+- 各单元测试二进制：`build/tests/isdm/isdm_test_*`
+
+## 4. 运行测试
+
 ```bash
-# 原始设计文档（160章，很长但值得）
-cat doc/高密度工业自描述通信中间件��计文档.md | less
+ctest --test-dir build --output-on-failure
 ```
 
-### 3️⃣ 开始第一个实现 (今天)
+当前覆盖：
 
-#### 任务：实现 TypeDescriptor
+```text
+类型系统 / 反射 / SchemaRegistry / Codec / Header / Frame / CRC32C /
+Endpoint / Discovery / PeerTable / UDP(单播+组播) / DiscoveryManager /
+SchemaWire / SchemaSync / DataMessage / Batch / Node(发现/同步/收发/
+离线检测/快照恢复) / Metrics / 解析器 Fuzz
+```
 
-**1. 创建头文件：**
+## 5. 运行端到端 Demo
+
 ```bash
-vim include/isdm/core/type/type_descriptor.h
+./build/examples/isdm_demo_pub_sub
 ```
 
-参考结构：
+一个进程内两个节点（Publisher + Subscriber）：
+
+```text
+组播 HELLO 自动发现
+        ↓
+发布端推送 Schema
+        ↓
+订阅端自动注册（无需预知 Motor 结构）
+        ↓
+发布端发布 Motor
+        ↓
+订阅端用学到的 Schema 逐字段解码打印
+```
+
+## 6. 真实 API 快速上手
+
+所有头文件已聚合在 `src/isdm/isdm.h`。定义一个结构体并用宏自动生成 Schema：
+
 ```cpp
-class TypeDescriptor {
- public:
-  void AddField(const std::string& name, PrimitiveType type);
-  const FieldDescriptor* GetField(const std::string& name) const;
-  size_t size() const;
-  
- private:
-  uint32_t type_id_;
-  std::string name_;
-  std::vector<FieldDescriptor> fields_;
+#include "isdm/isdm.h"
+
+namespace app {
+struct Motor {
+    std::uint32_t id;
+    float speed;
+    float current;
 };
+}  // namespace app
+
+// 编译期从 C++ 结构体生成 TypeDescriptor
+ISDM_STRUCT(app::Motor,
+            ISDM_FIELD(app::Motor, id),
+            ISDM_FIELD(app::Motor, speed),
+            ISDM_FIELD(app::Motor, current))
 ```
 
-**2. 实现源文件：**
-```bash
-vim src/core/type/type_descriptor.cc
-```
+发布端：
 
-**3. 编写测试：**
-```bash
-vim tests/core/type_descriptor_test.cc
-```
-
-参考现有的 `tests/core/primitive_type_test.cc`
-
-**4. 编译运行：**
-```bash
-cd build
-make -j8
-ctest --output-on-failure
-```
-
----
-
-## 📋 本周任务清单
-
-**Phase 1 - Week 1: Type System**
-
-- [ ] 实现 `TypeDescriptor` 类
-  - [ ] 头文件定义
-  - [ ] 源文件实现
-  - [ ] 单元测试
-  - [ ] 测试通过
-
-- [ ] 实现 `FieldDescriptor` 结构
-  - [ ] 头文件定义
-  - [ ] 测试用例
-
-- [ ] 实现编译期反射宏
-  - [ ] `ISDM_STRUCT` 宏
-  - [ ] `ISDM_FIELD` 宏
-  - [ ] 示例测试
-
-**预计时间：** 3-4天
-
-**验收标准：**
 ```cpp
-TypeDescriptor desc;
-desc.AddField("speed", PrimitiveType::kFloat32);
-desc.AddField("current", PrimitiveType::kFloat32);
+using namespace isdm;
 
-EXPECT_EQ(desc.size(), 8);
-EXPECT_EQ(desc.GetField("speed")->offset, 0);
-EXPECT_EQ(desc.GetField("current")->offset, 4);
+NodeConfig cfg;
+cfg.node_id = 1;
+cfg.node_name = "publisher";
+cfg.advertise_endpoint = Endpoint(239, 255, 20, 99, 39999);  // 组播发现组
+cfg.control_bind = Endpoint(0, 0, 0, 0, 39999);
+cfg.data_bind = Endpoint(127, 0, 0, 1, 0);  // 0 端口自动分配
+
+Node node(cfg);
+const auto ref = describe<app::Motor>(100, 1);   // TypeId=100, Version=1
+node.register_type(ref.descriptor(), ref.name_table_size());
+node.start();                                     // 线程驱动，开盒即用
+
+app::Motor motor{1, 1500.0f, 20.5f};
+node.publish(1, 100, DataView(&motor, sizeof(motor)));
 ```
 
----
+订阅端（无需预知 Motor 结构，纯 Schema 驱动解码）：
 
-## 🔍 代码在哪里？
+```cpp
+Node sub(sub_cfg);
+sub.start();
 
-### 关键文件位置
-
-**已实现：**
-```
-include/isdm/core/type/primitive_type.h  ← 基础类型定义（已完成）
-include/isdm/status.h                    ← 错误处理（已完成）
-tests/core/primitive_type_test.cc        ← 示例测试（已完成）
-```
-
-**待实现（本周）：**
-```
-include/isdm/core/type/type_descriptor.h      ← 你要实现的
-src/core/type/type_descriptor.cc              ← 你要实现的
-include/isdm/core/type/field_descriptor.h     ← 你要实现的
-tests/core/type_descriptor_test.cc            ← 你要实现的
+sub.subscribe(100, [](ObjectId oid, TypeId tid, DataView payload, Timestamp) {
+    // 用自动同步来的 Schema 逐字段解码，而不是 memcpy 进已知结构
+    const TypeDescriptor* desc = sub.registry().find(tid);
+    // 遍历 desc->fields 读取 payload
+});
 ```
 
-**参考文档：**
-```
-doc/架构设计与开发计划.md    ← 第2.2.1节有详细接口设计
-ROADMAP.md                    ← Phase 1任务清单
-PROJECT_SUMMARY.md            ← 总体概览
-```
+可选能力：
 
----
-
-## 🛠️ 开发工具
-
-### 推荐IDE: VSCode
-
-```bash
-# 安装扩展
-code --install-extension llvm-vs-code-extensions.vscode-clangd
-code --install-extension ms-vscode.cmake-tools
-
-# 打开项目
-code /home/wwk/workspace/ISDM
+```cpp
+node.publish_batch(ids, payloads, count, type_id, payload_size);  // 一帧多对象
+sub.request_snapshot(100);                                        // 请求全量快照恢复
+node.set_peer_state_callback(...);                                // 节点上线/离线回调
+node.metrics().snapshot();                                        // tx/rx 计数
 ```
 
-**自动补全：**  
-项目已自动生成 `compile_commands.json`，clangd会自动识别。
+## 7. 关键概念
 
-### 编译和测试命令
+- **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。
+- **Control / Data 平面分离**：组播发现走控制面，数据走单播数据面，互不阻塞。
+- **可插拔 Transport**：核心只依赖 `ITransport`，当前实现 UDP（单播+组播），未来可换 SHM/TCP。
+- **线程驱动**：`node.start()` 自动启动控制线程（发现/心跳/离线）与数据线程（收帧派发）。
 
-```bash
-# 进入build目录
-cd build
+## 8. 目录
 
-# 清理重新编译
-make clean && make -j8
-
-# 运行所有测试
-ctest --output-on-failure
-
-# 运行单个测试
-./bin/primitive_type_test
-
-# 调试模式编译
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-make -j8
-
-# Release模式编译
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j8
+```text
+src/isdm/         中间件全部源码（头文件与 .cc 同目录）
+tests/isdm/       单元 + 集成测试
+examples/         端到端 Demo
+doc/              设计文档
+thirdparty/       readerwriterqueue（git submodule，BSD-2-Clause）
+THIRD_PARTY_NOTICES.md
 ```
-
-### 调试工具
-
-```bash
-# 内存检测
-valgrind --leak-check=full ./bin/primitive_type_test
-
-# 地址检测（需要Debug编译）
-./bin/primitive_type_test
-
-# 线程检测
-clang++ -fsanitize=thread -g test.cc
-```
-
----
-
-## 📞 遇到问题？
-
-### 常见问题
-
-**Q: setup.sh报错找不到依赖？**  
-A: 确保安装了 CMake 3.15+ 和 GCC 9+ / Clang 10+
-
-**Q: 编译失败？**  
-A: 检查 `build/CMakeFiles/CMakeError.log`
-
-**Q: 测试失败？**  
-A: 这是正常的，因为大部分功能还未实现
-
-**Q: 不知道从哪里开始？**  
-A: 从实现 TypeDescriptor 开始，参考 `doc/架构设计与开发计划.md` 第2.2.1节
-
-### 获取帮助
-
-1. 查看文档：`doc/架构设计与开发计划.md`
-2. 查看示例：`tests/core/primitive_type_test.cc`
-3. 查看路线图：`ROADMAP.md`
-
----
-
-## 🎯 成功的标志
-
-### 今天结束时
-- ✅ 项目已初始化
-- ✅ 能够成功编译
-- ✅ 至少一个测试通过
-
-### 本周结束时
-- ✅ TypeDescriptor 实现完成
-- ✅ 测试覆盖核心功能
-- ✅ 能够创建简单的类型描述
-
-### 下周目标
-- ✅ SchemaRegistry 实现
-- ✅ 类型可以注册和查询
-
----
-
-## 💪 你能行！
-
-记住项目的核心原则：
-
-> **不追求一次性完美，而是通过迭代逐步优化。**
-
-现在开始写第一行代码吧！ 🚀
-
-```bash
-cd /home/wwk/workspace/ISDM
-./setup.sh
-vim include/isdm/core/type/type_descriptor.h
-```
-
-Good luck! 加油！
