@@ -27,6 +27,18 @@ bool UdpTransport::open() {
             return false;
         }
     }
+    if (config_.receive_buffer_size > 0 &&
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &config_.receive_buffer_size,
+                     sizeof(config_.receive_buffer_size)) < 0) {
+        close();
+        return false;
+    }
+    if (config_.send_buffer_size > 0 &&
+        ::setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &config_.send_buffer_size,
+                     sizeof(config_.send_buffer_size)) < 0) {
+        close();
+        return false;
+    }
     if (config_.non_blocking) {
         const int flags = ::fcntl(fd_, F_GETFL, 0);
         if (flags < 0 || ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) < 0) {

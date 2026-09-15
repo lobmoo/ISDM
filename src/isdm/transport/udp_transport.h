@@ -16,6 +16,8 @@ public:
         bool multicast_loopback = true;
         bool non_blocking = true;
         bool reuse_address = true;
+        int receive_buffer_size = 4 * 1024 * 1024;
+        int send_buffer_size = 4 * 1024 * 1024;
     };
 
     explicit UdpTransport(Config config);

@@ -26,6 +26,7 @@
 #include "isdm/protocol/data_message.h"
 #include "isdm/protocol/batch_data_message.h"
 #include "isdm/protocol/frame.h"
+#include "isdm/protocol/fragment.h"
 #include "isdm/protocol/header.h"
 #include "isdm/protocol/schema_sync.h"
 #include "isdm/protocol/snapshot.h"
@@ -69,6 +70,9 @@ public:
     SchemaRegistry& registry() noexcept { return registry_; }
     const SchemaRegistry& registry() const noexcept { return registry_; }
     Metrics& metrics() noexcept { return metrics_; }
+    transport::Endpoint data_endpoint() const noexcept {
+        return data_ == nullptr ? transport::Endpoint{} : data_->local_endpoint();
+    }
     const PeerTable& peers() const noexcept { return discovery_ == nullptr ? empty_peers_ : discovery_->peers(); }
 
     bool register_type(const TypeDescriptor& desc, std::size_t name_table_size) {
@@ -316,7 +320,7 @@ private:
             ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
             if (!encode_frame(header, payload_storage, sync_writer.offset(), frame_writer))
                 return;
-            data_->send_to(DataView(frame_storage, frame_writer.offset()), peer_endpoint);
+            send_to_peer(DataView(frame_storage, frame_writer.offset()), peer_endpoint);
         });
     }
 
@@ -330,19 +334,31 @@ private:
             metrics_.rx_frames++;
             metrics_.rx_bytes += size;
 
-            protocol::Frame frame;
-            if (!parse_frame(DataView(recv_.data(), size), frame)) {
-                metrics_.rx_dropped++;
-                continue;
+            DataView datagram(recv_.data(), size);
+            if (datagram.size() >= 2 &&
+                datagram.read_at<std::uint16_t>(0) == protocol::kFragmentMagic) {
+                std::vector<std::byte> completed;
+                if (assembler_.feed(datagram, completed)) {
+                    dispatch_frame(DataView(completed.data(), completed.size()), source);
+                }
+            } else {
+                dispatch_frame(datagram, source);
             }
+        }
+    }
 
-            if (frame.header.message_type == protocol::MessageType::kSchema) {
-                handle_schema_response(frame.payload);
-            } else if (frame.header.message_type == protocol::MessageType::kData) {
-                handle_data_payload(frame.payload);
-            } else if (frame.header.message_type == protocol::MessageType::kSnapshotRequest) {
-                handle_snapshot_request(frame.payload, source);
-            }
+    void dispatch_frame(DataView frame_bytes, const transport::Endpoint& source) {
+        protocol::Frame frame;
+        if (!parse_frame(frame_bytes, frame)) {
+            metrics_.rx_dropped++;
+            return;
+        }
+        if (frame.header.message_type == protocol::MessageType::kSchema) {
+            handle_schema_response(frame.payload);
+        } else if (frame.header.message_type == protocol::MessageType::kData) {
+            handle_data_payload(frame.payload);
+        } else if (frame.header.message_type == protocol::MessageType::kSnapshotRequest) {
+            handle_snapshot_request(frame.payload, source);
         }
     }
 
@@ -353,7 +369,7 @@ private:
         bool sent = false;
         discovery_->peers().for_each([&](const PeerInfo& peer) {
             if (peer.online) {
-                if (data_->send_to(frame, peer.endpoint) != 0) sent = true;
+                if (send_to_peer(frame, peer.endpoint)) sent = true;
             }
         });
         return sent;
@@ -365,9 +381,23 @@ private:
         metrics_.tx_bytes += frame.size();
         bool sent = false;
         discovery_->peers().for_each([&](const PeerInfo& peer) {
-            if (data_->send_to(frame, peer.endpoint) != 0) sent = true;
+            if (send_to_peer(frame, peer.endpoint)) sent = true;
         });
         return sent;
+    }
+
+    // Sends a frame to one peer, transparently fragmenting large frames into
+    // MTU-sized datagrams so they survive real network links.
+    bool send_to_peer(DataView frame, const transport::Endpoint& dest) {
+        if (frame.size() > kMaxDatagram) {
+            const std::uint32_t frame_id = next_frame_id_.fetch_add(1, std::memory_order_relaxed);
+            bool any = false;
+            protocol::fragment_frame(frame_id, frame, kMaxDatagram, [&](DataView datagram) {
+                if (data_->send_to(datagram, dest) != 0) any = true;
+            });
+            return any;
+        }
+        return data_->send_to(frame, dest) != 0;
     }
 
     // Distinguishes a batch data frame from a single-object data frame and
@@ -507,7 +537,7 @@ private:
             std::byte frame_storage[kMaxFrame];
             ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
             if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer)) continue;
-            data_->send_to(DataView(frame_storage, frame_writer.offset()), dest);
+            send_to_peer(DataView(frame_storage, frame_writer.offset()), dest);
         }
     }
 
@@ -551,6 +581,9 @@ private:
     };
     std::mutex retained_mutex_;
     std::unordered_map<TypeId, std::vector<RetainedObject>> retained_;
+    protocol::FragmentAssembler assembler_;
+    std::atomic<std::uint32_t> next_frame_id_{0};
+    static constexpr std::size_t kMaxDatagram = 1400;
     bool started_ = false;
 };
 
