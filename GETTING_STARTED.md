@@ -49,9 +49,18 @@ ctest --test-dir build --output-on-failure
 ```text
 类型系统 / 反射 / SchemaRegistry / Codec / Header / Frame / CRC32C /
 Endpoint / Discovery / PeerTable / UDP(单播+组播) / DiscoveryManager /
-SchemaWire / SchemaSync / DataMessage / Batch / Node(发现/同步/收发/
-离线检测/快照恢复) / Metrics / 解析器 Fuzz
+SchemaWire / SchemaSync / DataMessage / Batch / Fragment(分片重组) /
+Node(发现/同步/收发/离线检测/快照恢复) / Metrics / 解析器 Fuzz / 压测
 ```
+
+压测（Stress）验证高密度对象量端到端正确性并报告吞吐：
+
+```bash
+./build/tests/isdm/isdm_test_stress
+# 期望输出：sent=20000 received=20000 ... dropped=0
+```
+
+大帧通过 UDP 分片重组（MTU 安全数据报）传输，在 WSL2/真实网络下均可靠送达。
 
 ## 5. 运行端到端 Demo
 
