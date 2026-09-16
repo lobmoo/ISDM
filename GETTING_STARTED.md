@@ -49,7 +49,7 @@ ctest --test-dir build --output-on-failure
 ```text
 类型系统 / 反射 / SchemaRegistry / Codec / Header / Frame / CRC32C /
 Endpoint / Discovery / PeerTable / UDP(单播+组播) / DiscoveryManager /
-SchemaWire / SchemaSync / DataMessage / Batch / Fragment(分片重组) /
+SchemaWire / SchemaSync / DataMessage / Batch / Fragment(分片重组) / Delta /
 Node(发现/同步/收发/离线检测/快照恢复) / Metrics / 解析器 Fuzz / 压测
 ```
 
@@ -145,6 +145,12 @@ node.publish_batch(ids, payloads, count, type_id, payload_size);  // 一帧多�
 sub.request_snapshot(100);                                        // 请求全量快照恢复
 node.set_peer_state_callback(...);                                // 节点上线/离线回调
 node.metrics().snapshot();                                        // tx/rx 计数
+
+// Delta 字段级增量：只传变化字段，大幅省带宽
+node.publish_delta(object_id, type_id, &old_value, &new_value, sizeof(T));
+node.subscribe_delta(type_id, [](ObjectId oid, TypeId, DataView full, Timestamp) {
+    // 始终收到打补丁后的全量对象
+});
 ```
 
 ## 7. 关键概念

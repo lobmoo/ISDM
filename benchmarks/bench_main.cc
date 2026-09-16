@@ -23,10 +23,22 @@ struct Msg {
     double d;
 };
 
+// A larger struct so field-level Delta shows its bandwidth win.
+struct Plant {
+    std::uint32_t id;
+    float p0, p1, p2, p3, p4, p5, p6, p7;
+};
+
 }  // namespace bench
 
 ISDM_STRUCT(bench::Msg, ISDM_FIELD(bench::Msg, id), ISDM_FIELD(bench::Msg, a),
             ISDM_FIELD(bench::Msg, b), ISDM_FIELD(bench::Msg, c), ISDM_FIELD(bench::Msg, d))
+
+ISDM_STRUCT(bench::Plant, ISDM_FIELD(bench::Plant, id), ISDM_FIELD(bench::Plant, p0),
+            ISDM_FIELD(bench::Plant, p1), ISDM_FIELD(bench::Plant, p2),
+            ISDM_FIELD(bench::Plant, p3), ISDM_FIELD(bench::Plant, p4),
+            ISDM_FIELD(bench::Plant, p5), ISDM_FIELD(bench::Plant, p6),
+            ISDM_FIELD(bench::Plant, p7))
 
 namespace {
 
@@ -134,12 +146,34 @@ void bench_end_to_end() {
     sub.stop();
 }
 
+void bench_delta_bytes() {
+    const auto ref = isdm::describe<bench::Plant>(200, 1);
+    bench::Plant a{1, 1, 2, 3, 4, 5, 6, 7, 8};
+    bench::Plant b = a;
+    b.p5 = 99.0f;  // only one field changes
+
+    std::array<std::byte, 256> storage{};
+    isdm::ByteWriter w(isdm::MutableDataView(storage.data(), storage.size()));
+    // Delta bytes when one field changes.
+    isdm::ByteWriter dw(isdm::MutableDataView(storage.data(), storage.size()));
+    const bool encoded = isdm::protocol::encode_delta(ref.descriptor(), 1, 200, 0, &a, &b, dw);
+
+    // Full object bytes.
+    const std::size_t full = sizeof(bench::Plant);
+    std::size_t delta = 0;
+    if (encoded) delta = dw.offset();
+    std::printf("delta  full=%zuB changed-1-field=%zuB (%.0f%%)\n", full, delta,
+                delta == 0 ? 0.0 : 100.0 * (1.0 - static_cast<double>(delta) / full));
+    (void)w;
+}
+
 }  // namespace
 
 int main() {
     std::printf("== ISDM benchmark ==\n");
     bench_codec();
     bench_queue();
+    bench_delta_bytes();
     bench_end_to_end();
     return 0;
 }
