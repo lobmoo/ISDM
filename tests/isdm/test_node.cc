@@ -269,4 +269,51 @@ TEST(NodeTypedTest, PublishesAndReceivesTypedValue) {
     EXPECT_FLOAT_EQ(got.speed, 1500.0f);
 }
 
+TEST(NodeDeltaTest, SubscriberAppliesDeltaToFullValue) {
+    const transport::Endpoint group(239, 255, 10, 13, 39307);
+
+    Node publisher(make_config(1, "publisher", group));
+    ASSERT_TRUE(publisher.register_type_typed<typed_test::Motor>(100));
+    ASSERT_TRUE(publisher.start());
+
+    Node subscriber(make_config(2, "subscriber", group));
+    ASSERT_TRUE(subscriber.start());
+
+    std::atomic<int> updates{0};
+    typed_test::Motor got{};
+    subscriber.subscribe_delta(
+        100, [&](ObjectId, TypeId, DataView payload, Timestamp) {
+            if (payload.size() == sizeof(typed_test::Motor)) {
+                std::memcpy(&got, payload.data(), sizeof(got));
+                ++updates;
+            }
+        });
+
+    for (int i = 0; i < 400 && (publisher.peers().size() == 0 || subscriber.peers().size() == 0);
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_GT(publisher.peers().size(), 0U);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // schema sync
+
+    // Full object seeds the cache.
+    typed_test::Motor a{1, 100.0f};
+    ASSERT_TRUE(publisher.publish_typed(1, 100, a));
+    for (int i = 0; i < 100 && updates.load() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_GE(updates.load(), 1);
+
+    // Incremental delta changes only 'speed'; the subscriber patches and the
+    // callback still receives the full, latest value.
+    typed_test::Motor b{1, 200.0f};
+    ASSERT_TRUE(publisher.publish_delta(1, 100, &a, &b, sizeof(typed_test::Motor)));
+    for (int i = 0; i < 100 && updates.load() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_GE(updates.load(), 2);
+    EXPECT_EQ(got.id, 1u);
+    EXPECT_FLOAT_EQ(got.speed, 200.0f);
+}
+
 }  // namespace isdm::test

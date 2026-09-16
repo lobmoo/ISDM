@@ -25,6 +25,7 @@
 #include "isdm/reflect.h"
 #include "isdm/protocol/data_message.h"
 #include "isdm/protocol/batch_data_message.h"
+#include "isdm/protocol/delta.h"
 #include "isdm/protocol/frame.h"
 #include "isdm/protocol/fragment.h"
 #include "isdm/protocol/header.h"
@@ -177,6 +178,31 @@ public:
         return publish(object_id, type_id, DataView(&value, sizeof(T)), ts);
     }
 
+    // Sends only the fields that changed between old and new (same struct). The
+    // type must be registered locally so its field layout is known. Opt-in:
+    // regular publish() still sends full objects.
+    bool publish_delta(ObjectId object_id, TypeId type_id, const void* old_bytes,
+                       const void* new_bytes, std::size_t struct_size, Timestamp ts = 0) {
+        if (!started_ || old_bytes == nullptr || new_bytes == nullptr) return false;
+        const TypeDescriptor* desc = registry().find(type_id);
+        if (desc == nullptr || desc->fixed_size != struct_size) return false;
+
+        std::byte payload_storage[kMaxFrame];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!protocol::encode_delta(*desc, object_id, type_id, ts == 0 ? now_ns() : ts,
+                                    old_bytes, new_bytes, writer)) {
+            return false;
+        }
+        protocol::Header header;
+        header.message_type = protocol::MessageType::kDelta;
+        std::byte frame_storage[kMaxFrame];
+        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+        if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer))
+            return false;
+        metrics_.tx_batches++;
+        return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
+    }
+
     // Publishes many objects of one fixed-layout type in a single frame.
     // payloads is a flat buffer of count * payload_size bytes.
     bool publish_batch(const ObjectId* ids, const void* payloads, std::size_t count,
@@ -225,6 +251,13 @@ public:
                     cb(object_id, value);
                 }
             });
+    }
+
+    // Delta subscription: the callback always receives the FULL current value.
+    // The first full object seeds the cache; subsequent deltas patch it.
+    void subscribe_delta(TypeId type_id, DataCallback cb) {
+        delta_enabled_.store(true, std::memory_order_release);
+        subscribe(type_id, std::move(cb));
     }
 
     void subscribe_object(ObjectId object_id, DataCallback cb) {
@@ -357,9 +390,38 @@ private:
             handle_schema_response(frame.payload);
         } else if (frame.header.message_type == protocol::MessageType::kData) {
             handle_data_payload(frame.payload);
+        } else if (frame.header.message_type == protocol::MessageType::kDelta) {
+            handle_delta(frame.payload);
         } else if (frame.header.message_type == protocol::MessageType::kSnapshotRequest) {
             handle_snapshot_request(frame.payload, source);
         }
+    }
+
+    // Applies an incremental delta onto the cached full value, then delivers
+    // the patched full value to callbacks.
+    void handle_delta(DataView payload) {
+        if (!delta_enabled_.load(std::memory_order_acquire)) return;
+        protocol::DeltaMessage delta;
+        if (!decode_delta(payload, delta)) return;
+        const TypeDescriptor* desc = registry().find(delta.type_id);
+        if (desc == nullptr) return;
+
+        std::vector<std::byte> cached;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            auto it = object_cache_.find(delta.object_id);
+            if (it == object_cache_.end()) return;  // no base to patch yet
+            cached = it->second;
+        }
+        if (cached.size() != desc->fixed_size) return;
+        if (!protocol::apply_delta(*desc, cached.data(), delta)) return;
+
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            object_cache_[delta.object_id] = cached;
+        }
+        dispatch(delta.object_id, delta.type_id, DataView(cached.data(), cached.size()),
+                 delta.timestamp);
     }
 
     // Sends a fully-framed message to all online peers; true if any send landed.
@@ -409,6 +471,7 @@ private:
             if (!decode_batch_data(payload, message)) return;
             metrics_.rx_objects += message.count();
             for (std::size_t i = 0; i < message.count(); ++i) {
+                cache_object(message.object_id(i), message.payload(i));
                 dispatch(message.object_id(i), message.type_id, message.payload(i),
                          message.timestamp);
             }
@@ -416,8 +479,17 @@ private:
             protocol::DataMessage message;
             if (!decode_data_message(payload, message)) return;
             metrics_.rx_objects++;
+            cache_object(message.object_id, message.payload);
             dispatch(message.object_id, message.type_id, message.payload, message.timestamp);
         }
+    }
+
+    // Seeds the delta cache with a full object value when delta is enabled.
+    void cache_object(ObjectId object_id, DataView value) {
+        if (!delta_enabled_.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        object_cache_[object_id] =
+            std::vector<std::byte>(value.data(), value.data() + value.size());
     }
 
     // One full control + data iteration, used by pump() (single-threaded mode).
@@ -590,6 +662,9 @@ private:
     protocol::FragmentAssembler assembler_;
     std::atomic<std::uint32_t> next_frame_id_{0};
     static constexpr std::size_t kMaxDatagram = 1400;
+    std::atomic<bool> delta_enabled_{false};
+    std::mutex cache_mutex_;
+    std::unordered_map<ObjectId, std::vector<std::byte>> object_cache_;
     bool started_ = false;
 };
 
