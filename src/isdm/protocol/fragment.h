@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <unordered_map>
@@ -39,6 +40,8 @@ void fragment_frame(std::uint32_t frame_id, DataView frame, std::size_t max_slic
 // receiving Node must own one assembler on its data thread.
 class FragmentAssembler {
 public:
+    static constexpr std::size_t kMaxPending = 4096;
+
     // Feeds one datagram. Returns true and fills complete_out when a full frame
     // has been reassembled (the entry is then consumed).
     bool feed(DataView datagram, std::vector<std::byte>& complete_out) {
@@ -53,15 +56,20 @@ public:
         }
         if (magic != kFragmentMagic || count == 0 || sequence >= count) return false;
 
-        const DataView slice = datagram.sub_view(reader.offset(), datagram.size() - reader.offset());
+        const DataView slice =
+            datagram.sub_view(reader.offset(), datagram.size() - reader.offset());
         auto& entry = pending_[frame_id];
         entry.count = count;
+        entry.last = std::chrono::steady_clock::now();
         entry.slices[sequence] =
             std::vector<std::byte>(slice.data(), slice.data() + slice.size());
 
+        if (pending_.size() > kMaxPending) {
+            drop_oldest();
+        }
+
         if (entry.slices.size() == count) {
             std::vector<std::byte> full;
-            full.reserve(count * slice.size());
             for (std::uint16_t i = 0; i < count; ++i) {
                 const auto& part = entry.slices[i];
                 full.insert(full.end(), part.begin(), part.end());
@@ -73,11 +81,33 @@ public:
         return false;
     }
 
+    // Drops incomplete fragment groups that have seen no update longer than
+    // timeout, bounding memory even when fragments are lost on the wire.
+    void expire(std::chrono::steady_clock::time_point now,
+                std::chrono::milliseconds timeout) {
+        for (auto it = pending_.begin(); it != pending_.end();) {
+            if (now - it->second.last > timeout) {
+                it = pending_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     std::size_t pending_count() const { return pending_.size(); }
 
 private:
+    void drop_oldest() {
+        auto oldest = pending_.begin();
+        for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+            if (it->second.last < oldest->second.last) oldest = it;
+        }
+        if (oldest != pending_.end()) pending_.erase(oldest);
+    }
+
     struct Entry {
         std::uint16_t count = 0;
+        std::chrono::steady_clock::time_point last;
         std::map<std::uint16_t, std::vector<std::byte>> slices;
     };
     std::unordered_map<std::uint32_t, Entry> pending_;

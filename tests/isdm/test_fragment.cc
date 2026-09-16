@@ -1,4 +1,5 @@
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
@@ -73,6 +74,45 @@ TEST(FragmentTest, RejectsMissingFragment) {
                                     restored));
     }
     EXPECT_TRUE(restored.empty());
+}
+
+TEST(FragmentTest, ExpiresIncompleteGroups) {
+    std::vector<std::byte> original(1024, std::byte{0x33});
+    std::vector<std::vector<std::byte>> fragments;
+    protocol::fragment_frame(21, DataView(original.data(), original.size()), 128,
+                             [&](DataView datagram) {
+                                 fragments.emplace_back(datagram.data(),
+                                                         datagram.data() + datagram.size());
+                             });
+
+    protocol::FragmentAssembler assembler;
+    std::vector<std::byte> restored;
+    // Only feed the first fragment; the frame is incomplete.
+    ASSERT_FALSE(assembler.feed(DataView(fragments[0].data(), fragments[0].size()), restored));
+    ASSERT_EQ(assembler.pending_count(), 1U);
+
+    // After a timeout it must be evicted.
+    const auto later = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    assembler.expire(later, std::chrono::milliseconds(100));
+    EXPECT_EQ(assembler.pending_count(), 0U);
+}
+
+TEST(FragmentTest, BoundsPendingGroups) {
+    protocol::FragmentAssembler assembler;
+    std::vector<std::byte> restored;
+    // Feed many incomplete single-fragment frames; the assembler must not grow
+    // without bound.
+    std::array<std::byte, 20> datagram{};
+    ByteWriter writer(MutableDataView(datagram.data(), datagram.size()));
+    for (std::uint32_t i = 0; i < 10000; ++i) {
+        ByteWriter w(MutableDataView(datagram.data(), datagram.size()));
+        w.write<std::uint16_t>(isdm::protocol::kFragmentMagic);
+        w.write<std::uint32_t>(i);          // unique frame_id
+        w.write<std::uint16_t>(0);          // sequence
+        w.write<std::uint16_t>(2);          // count (never completes)
+        EXPECT_FALSE(assembler.feed(DataView(datagram.data(), datagram.size()), restored));
+    }
+    EXPECT_LE(assembler.pending_count(), protocol::FragmentAssembler::kMaxPending);
 }
 
 }  // namespace isdm::test

@@ -453,8 +453,14 @@ private:
 
     // Background data thread: drain incoming data/schema frames.
     void data_loop() {
+        auto last_evict = std::chrono::steady_clock::now();
         while (running_.load(std::memory_order_acquire)) {
             drain_data();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_evict >= std::chrono::seconds(1)) {
+                assembler_.expire(now, std::chrono::seconds(10));
+                last_evict = now;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
