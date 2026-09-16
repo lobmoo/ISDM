@@ -7,7 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(ISDM_BUILD_TESTS "Build ISDM tests" ON)
-option(ISDM_BUILD_BENCHMARKS "Build ISDM benchmarks" OFF)
+option(ISDM_BUILD_BENCHMARKS "Build ISDM benchmarks" ON)
 option(ISDM_BUILD_EXAMPLES "Build ISDM examples" ON)
 
 find_package(Threads REQUIRED)
@@ -21,6 +21,10 @@ endif()
 
 if(ISDM_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if(ISDM_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
 endif()
 
 install(DIRECTORY src/isdm DESTINATION include)
