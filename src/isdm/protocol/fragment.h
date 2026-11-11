@@ -4,11 +4,12 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "isdm/codec/codec.h"
 #include "isdm/core/data_view.h"
+#include "isdm/transport/endpoint.h"
 
 namespace isdm::protocol {
 
@@ -36,15 +37,20 @@ void fragment_frame(std::uint32_t frame_id, DataView frame, std::size_t max_slic
     }
 }
 
-// Reassembles fragmented datagrams into complete frames. Non-thread-safe; each
-// receiving Node must own one assembler on its data thread.
+// Reassembles fragmented datagrams into complete frames. Each receiving Node
+// owns one assembler on its data thread. Groups are keyed by (source, frame_id)
+// so two publishers using the same frame_id cannot mix their slices.
 class FragmentAssembler {
 public:
+    using SourceKey = transport::Endpoint;
     static constexpr std::size_t kMaxPending = 4096;
+    static constexpr std::size_t kMaxFragments = 4096;
+    static constexpr std::size_t kMaxFrameBytes = 65536;
 
     // Feeds one datagram. Returns true and fills complete_out when a full frame
     // has been reassembled (the entry is then consumed).
-    bool feed(DataView datagram, std::vector<std::byte>& complete_out) {
+    bool feed(DataView datagram, const SourceKey& source,
+              std::vector<std::byte>& complete_out) {
         ByteReader reader(datagram);
         std::uint16_t magic = 0;
         std::uint32_t frame_id = 0;
@@ -54,27 +60,46 @@ public:
             !reader.read(count)) {
             return false;
         }
-        if (magic != kFragmentMagic || count == 0 || sequence >= count) return false;
+        if (magic != kFragmentMagic || count == 0 || count > kMaxFragments ||
+            sequence >= count) {
+            return false;
+        }
 
         const DataView slice =
             datagram.sub_view(reader.offset(), datagram.size() - reader.offset());
-        auto& entry = pending_[frame_id];
+        if (slice.size() > kMaxFrameBytes) return false;
+
+        PendingKey key{source, frame_id};
+        auto it = pending_.find(key);
+        if (it == pending_.end()) {
+            if (pending_.size() >= kMaxPending) drop_oldest();
+            it = pending_.emplace(key, Entry{}).first;
+        }
+
+        Entry& entry = it->second;
         entry.count = count;
         entry.last = std::chrono::steady_clock::now();
+        const auto existing = entry.slices.find(sequence);
+        if (existing != entry.slices.end()) {
+            entry.bytes -= existing->second.size();
+        }
         entry.slices[sequence] =
             std::vector<std::byte>(slice.data(), slice.data() + slice.size());
-
-        if (pending_.size() > kMaxPending) {
-            drop_oldest();
+        entry.bytes += slice.size();
+        if (entry.bytes > kMaxFrameBytes) {
+            pending_.erase(it);
+            return false;
         }
 
         if (entry.slices.size() == count) {
             std::vector<std::byte> full;
+            full.reserve(entry.bytes);
             for (std::uint16_t i = 0; i < count; ++i) {
-                const auto& part = entry.slices[i];
-                full.insert(full.end(), part.begin(), part.end());
+                const auto part = entry.slices.find(i);
+                if (part == entry.slices.end()) return false;
+                full.insert(full.end(), part->second.begin(), part->second.end());
             }
-            pending_.erase(frame_id);
+            pending_.erase(it);
             complete_out = std::move(full);
             return true;
         }
@@ -97,6 +122,23 @@ public:
     std::size_t pending_count() const { return pending_.size(); }
 
 private:
+    struct PendingKey {
+        SourceKey source;
+        std::uint32_t frame_id = 0;
+
+        bool operator<(const PendingKey& other) const noexcept {
+            if (source != other.source) return source < other.source;
+            return frame_id < other.frame_id;
+        }
+    };
+
+    struct Entry {
+        std::uint16_t count = 0;
+        std::chrono::steady_clock::time_point last;
+        std::map<std::uint16_t, std::vector<std::byte>> slices;
+        std::size_t bytes = 0;
+    };
+
     void drop_oldest() {
         auto oldest = pending_.begin();
         for (auto it = pending_.begin(); it != pending_.end(); ++it) {
@@ -105,12 +147,7 @@ private:
         if (oldest != pending_.end()) pending_.erase(oldest);
     }
 
-    struct Entry {
-        std::uint16_t count = 0;
-        std::chrono::steady_clock::time_point last;
-        std::map<std::uint16_t, std::vector<std::byte>> slices;
-    };
-    std::unordered_map<std::uint32_t, Entry> pending_;
+    std::map<PendingKey, Entry> pending_;
 };
 
 }  // namespace isdm::protocol

@@ -250,6 +250,30 @@ sub.subscribe_typed<app::MotorV1>(310, [](isdm::ObjectId, const app::MotorV1& mo
 ./build/tests/isdm/isdm_test_schema_evolution
 ```
 
+### 6.3 快照与重连（M3）
+
+晚加入或断线重连的订阅者可以请求全量状态：
+
+```cpp
+sub.subscribe_typed<app::Motor>(310, [](isdm::ObjectId, const app::Motor& motor) {
+    // 实时更新和快照恢复都会来到这里
+});
+sub.request_snapshot(310);
+```
+
+发布端从有界 `ObjectStateStore` 冻结该类型的当前全量，发送 `Begin → Chunk × N → End`；订阅端先 staging，`End` 时校验完整性并去重后再回调。因此：
+
+- 缺块/超时/超过 staging 上限：整个快照丢弃，不会暴露半成品。
+- 快照与实时流重叠：`timestamp`（后续 `sequence`）更新的值胜出，旧快照对象不重复回调。
+- 分片按 `(source, frame_id)` 隔离；多 publisher 同 frame_id 不串包。
+
+运行测试：
+
+```bash
+./build/tests/isdm/isdm_test_snapshot_atomicity
+./build/tests/isdm/isdm_test_object_state_store
+```
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。

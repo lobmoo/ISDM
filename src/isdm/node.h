@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -425,6 +426,7 @@ public:
         ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
         protocol::SnapshotRequest request;
         request.type_id = type_id;
+        request.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
         if (!protocol::encode_snapshot_request(request, writer)) return false;
 
         protocol::Header header;
@@ -462,6 +464,37 @@ private:
         transport::Endpoint source;
     };
     using SchemaCallback = std::function<void(const IncomingObject&)>;
+
+    struct SnapshotStagedObject {
+        ObjectId object_id = 0;
+        SchemaId schema_id = 0;
+        Timestamp timestamp = 0;
+        std::uint64_t sequence = 0;
+        std::vector<std::byte> payload;
+    };
+
+    struct SnapshotStaging {
+        TypeId type_id = 0;
+        std::uint32_t request_id = 0;
+        std::uint32_t expected_count = 0;
+        std::uint32_t chunk_count = 0;
+        std::size_t bytes = 0;
+        std::chrono::steady_clock::time_point last_update;
+        std::unordered_set<std::uint32_t> seen_chunks;
+        std::unordered_map<ObjectId, SnapshotStagedObject> objects;
+    };
+
+    struct SnapshotKey {
+        transport::Endpoint source;
+        std::uint32_t snapshot_id = 0;
+
+        bool operator<(const SnapshotKey& other) const noexcept {
+            const auto lhs = source.to_raw();
+            const auto rhs = other.source.to_raw();
+            if (lhs != rhs) return lhs < rhs;
+            return snapshot_id < other.snapshot_id;
+        }
+    };
 
     static constexpr std::size_t kMaxFrame = 65536;
 
@@ -527,7 +560,7 @@ private:
             if (datagram.size() >= 2 &&
                 datagram.read_at<std::uint16_t>(0) == protocol::kFragmentMagic) {
                 std::vector<std::byte> completed;
-                if (assembler_.feed(datagram, completed)) {
+                if (assembler_.feed(datagram, source, completed)) {
                     dispatch_frame(DataView(completed.data(), completed.size()), source);
                 }
             } else {
@@ -550,6 +583,8 @@ private:
             handle_data_payload(frame.payload, frame.header.schema_id, source);
         } else if (frame.header.message_type == protocol::MessageType::kDelta) {
             handle_delta(frame.payload, frame.header.schema_id, source);
+        } else if (frame.header.message_type == protocol::MessageType::kSnapshot) {
+            handle_snapshot_payload(frame.payload, source);
         } else if (frame.header.message_type == protocol::MessageType::kSnapshotRequest) {
             handle_snapshot_request(frame.payload, source);
         }
@@ -618,6 +653,7 @@ private:
     }
 
     void subscribe_schema_aware(TypeId type_id, SchemaCallback cb) {
+        delta_enabled_.store(true, std::memory_order_release);
         std::lock_guard<std::mutex> lock(callback_mutex_);
         by_type_schema_.emplace_back(type_id, std::move(cb));
     }
@@ -801,6 +837,7 @@ private:
             const auto now = std::chrono::steady_clock::now();
             if (now - last_evict >= std::chrono::seconds(1)) {
                 assembler_.expire(now, std::chrono::seconds(10));
+                expire_snapshots(now);
                 last_evict = now;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -929,33 +966,263 @@ private:
         ByteReader reader(payload);
         protocol::SnapshotRequest request;
         if (!decode_snapshot_request(reader, request)) return;
-        reply_snapshot(request.type_id, source);
+        push_schemas_to(source);
+        reply_snapshot(request.type_id, request.request_id, source);
     }
 
-    // Replies to a snapshot request by sending each retained object of the type
-    // as a single data frame to the requester. M3 replaces this with an atomic
-    // Begin/Chunk/End stream.
-    void reply_snapshot(TypeId type_id, const transport::Endpoint& dest) {
-        const std::vector<ObjectState> objects = state_store_.snapshot(type_id);
-        for (const ObjectState& object : objects) {
-            protocol::DataMessage message;
-            message.object_id = object.object_id;
-            message.type_id = type_id;
-            message.timestamp = object.timestamp;
-            message.payload = DataView(object.payload.data(), object.payload.size());
+    void handle_snapshot_payload(DataView payload, const transport::Endpoint& source) {
+        ByteReader reader(payload);
+        std::uint16_t magic = 0;
+        std::uint8_t kind = 0;
+        if (!reader.read(magic) || !reader.read(kind)) return;
+        if (magic != protocol::kSnapshotMagic) return;
 
-            std::byte payload_storage[kMaxFrame];
-            ByteWriter data_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-            if (!encode_data_message(message, data_writer)) continue;
-
-            protocol::Header header;
-            header.message_type = protocol::MessageType::kData;
-            header.schema_id = object.schema_id;
-            std::byte frame_storage[kMaxFrame];
-            ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
-            if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer)) continue;
-            send_to_peer(DataView(frame_storage, frame_writer.offset()), dest);
+        switch (static_cast<protocol::SnapshotKind>(kind)) {
+            case protocol::SnapshotKind::kBegin:
+                handle_snapshot_begin(payload, source);
+                break;
+            case protocol::SnapshotKind::kChunk:
+                handle_snapshot_chunk(payload, source);
+                break;
+            case protocol::SnapshotKind::kEnd:
+                handle_snapshot_end(payload, source);
+                break;
+            default:
+                break;
         }
+    }
+
+    void handle_snapshot_begin(DataView payload, const transport::Endpoint& source) {
+        protocol::SnapshotBegin begin;
+        if (!protocol::decode_snapshot_begin(payload, begin)) return;
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        SnapshotStaging staging;
+        staging.type_id = begin.type_id;
+        staging.request_id = begin.request_id;
+        staging.expected_count = begin.expected_count;
+        staging.last_update = std::chrono::steady_clock::now();
+        snapshots_[SnapshotKey{source, begin.snapshot_id}] = std::move(staging);
+        metrics_.rx_snapshot_begin++;
+    }
+
+    void handle_snapshot_chunk(DataView payload, const transport::Endpoint& source) {
+        protocol::SnapshotChunk chunk;
+        if (!protocol::decode_snapshot_chunk(payload, chunk)) return;
+
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        const auto it = snapshots_.find(SnapshotKey{source, chunk.snapshot_id});
+        if (it == snapshots_.end()) {
+            metrics_.snapshot_discarded++;
+            return;
+        }
+        SnapshotStaging& staging = it->second;
+        staging.last_update = std::chrono::steady_clock::now();
+        staging.chunk_count = chunk.chunk_count;
+        if (!staging.seen_chunks.insert(chunk.chunk_index).second) return;
+
+        for (const protocol::SnapshotChunkEntry& entry : chunk.entries) {
+            const auto existing = staging.objects.find(entry.object_id);
+            if (existing != staging.objects.end()) {
+                staging.bytes -= existing->second.payload.size();
+            }
+            SnapshotStagedObject object;
+            object.object_id = entry.object_id;
+            object.schema_id = entry.schema_id;
+            object.timestamp = entry.timestamp;
+            object.sequence = entry.sequence;
+            if (entry.payload.size() != 0) {
+                object.payload.assign(entry.payload.data(),
+                                      entry.payload.data() + entry.payload.size());
+            }
+            staging.bytes += object.payload.size();
+            staging.objects[entry.object_id] = std::move(object);
+        }
+
+        if (staging.bytes > config_.snapshot_staging_limit_bytes) {
+            snapshots_.erase(it);
+            metrics_.snapshot_overflow++;
+            return;
+        }
+        metrics_.rx_snapshot_chunk++;
+    }
+
+    void handle_snapshot_end(DataView payload, const transport::Endpoint& source) {
+        protocol::SnapshotEnd end;
+        if (!protocol::decode_snapshot_end(payload, end)) return;
+
+        std::vector<SnapshotStagedObject> staged;
+        TypeId type_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            const auto it = snapshots_.find(SnapshotKey{source, end.snapshot_id});
+            if (it == snapshots_.end()) {
+                metrics_.snapshot_discarded++;
+                return;
+            }
+            SnapshotStaging& staging = it->second;
+            const bool complete = staging.chunk_count == end.chunk_count &&
+                                  staging.seen_chunks.size() == staging.chunk_count &&
+                                  staging.objects.size() == staging.expected_count &&
+                                  end.sent_count == staging.expected_count;
+            if (!complete) {
+                snapshots_.erase(it);
+                metrics_.snapshot_incomplete++;
+                return;
+            }
+
+            type_id = staging.type_id;
+            staged.reserve(staging.objects.size());
+            for (auto& item : staging.objects) {
+                staged.push_back(std::move(item.second));
+            }
+            snapshots_.erase(it);
+            metrics_.rx_snapshot_end++;
+        }
+
+        for (SnapshotStagedObject& object : staged) {
+            ObjectState state;
+            state.type_id = type_id;
+            state.object_id = object.object_id;
+            state.schema_id = object.schema_id;
+            state.timestamp = object.timestamp;
+            state.sequence = object.sequence;
+            state.payload = std::move(object.payload);
+            const DataView view(state.payload.data(), state.payload.size());
+            if (state_store_.upsert(std::move(state), true)) {
+                dispatch(object.object_id, type_id, object.schema_id, view,
+                         object.timestamp, source);
+            } else {
+                metrics_.rx_stale++;
+            }
+        }
+        metrics_.snapshot_received++;
+    }
+
+    void expire_snapshots(std::chrono::steady_clock::time_point now) {
+        std::lock_guard<std::mutex> lock(snapshot_mutex_);
+        for (auto it = snapshots_.begin(); it != snapshots_.end();) {
+            if (now - it->second.last_update > config_.snapshot_timeout) {
+                it = snapshots_.erase(it);
+                metrics_.snapshot_discarded++;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Replies to a snapshot request with an atomic Begin/Chunk/End stream.
+    // The store snapshot is the sender-side freeze; objects that cannot fit a
+    // single chunk are skipped (and counted by chunk count mismatch).
+    void reply_snapshot(TypeId type_id, std::uint32_t request_id,
+                        const transport::Endpoint& dest) {
+        const std::vector<ObjectState> objects = state_store_.snapshot(type_id);
+        std::size_t total_bytes = 0;
+        for (const ObjectState& object : objects) total_bytes += object.payload.size();
+        if (total_bytes > config_.snapshot_sender_copy_bytes) {
+            metrics_.snapshot_sender_overflow++;
+            return;
+        }
+
+        constexpr std::size_t kChunkHeaderSize = 20;
+        constexpr std::size_t kEntryHeaderSize = 32;
+        const std::size_t kPayloadLimit =
+            kMaxFrame - protocol::kHeaderSize - protocol::kCrcSize;
+
+        std::vector<const ObjectState*> sendable;
+        sendable.reserve(objects.size());
+        for (const ObjectState& object : objects) {
+            if (kChunkHeaderSize + kEntryHeaderSize + object.payload.size() >
+                kPayloadLimit) {
+                continue;
+            }
+            sendable.push_back(&object);
+        }
+
+        const std::uint32_t snapshot_id =
+            next_snapshot_id_.fetch_add(1, std::memory_order_relaxed);
+        protocol::SnapshotBegin begin;
+        begin.request_id = request_id;
+        begin.snapshot_id = snapshot_id;
+        begin.type_id = type_id;
+        begin.expected_count = static_cast<std::uint32_t>(sendable.size());
+        begin.timestamp = now_ns();
+        if (!send_snapshot_begin(begin, dest)) return;
+
+        std::vector<protocol::SnapshotChunk> chunks;
+        protocol::SnapshotChunk current;
+        current.snapshot_id = snapshot_id;
+        std::size_t current_size = kChunkHeaderSize;
+        for (const ObjectState* object : sendable) {
+            const std::size_t entry_size = kEntryHeaderSize + object->payload.size();
+            if (!current.entries.empty() &&
+                current_size + entry_size > kPayloadLimit) {
+                chunks.push_back(std::move(current));
+                current = protocol::SnapshotChunk{};
+                current.snapshot_id = snapshot_id;
+                current_size = kChunkHeaderSize;
+            }
+            protocol::SnapshotChunkEntry entry;
+            entry.object_id = object->object_id;
+            entry.schema_id = object->schema_id;
+            entry.timestamp = object->timestamp;
+            entry.sequence = object->sequence;
+            entry.payload = DataView(object->payload.data(), object->payload.size());
+            current.entries.push_back(entry);
+            current_size += entry_size;
+        }
+        if (!current.entries.empty()) chunks.push_back(std::move(current));
+
+        for (std::size_t i = 0; i < chunks.size(); ++i) {
+            chunks[i].chunk_index = static_cast<std::uint32_t>(i);
+            chunks[i].chunk_count = static_cast<std::uint32_t>(chunks.size());
+            send_snapshot_chunk(chunks[i], dest);
+        }
+
+        protocol::SnapshotEnd end;
+        end.snapshot_id = snapshot_id;
+        end.sent_count = static_cast<std::uint32_t>(sendable.size());
+        end.chunk_count = static_cast<std::uint32_t>(chunks.size());
+        send_snapshot_end(end, dest);
+    }
+
+    bool send_snapshot_frame(protocol::MessageType type, DataView payload,
+                             const transport::Endpoint& dest) {
+        std::byte frame_storage[kMaxFrame];
+        ByteWriter writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+        protocol::Header header;
+        header.message_type = type;
+        if (!encode_frame(header, payload.data(), payload.size(), writer)) return false;
+        return send_to_peer(DataView(frame_storage, writer.offset()), dest);
+    }
+
+    bool send_snapshot_begin(const protocol::SnapshotBegin& begin,
+                             const transport::Endpoint& dest) {
+        std::byte payload_storage[64];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!protocol::encode_snapshot_begin(begin, writer)) return false;
+        metrics_.tx_snapshot_begin++;
+        return send_snapshot_frame(protocol::MessageType::kSnapshot,
+                                   DataView(payload_storage, writer.offset()), dest);
+    }
+
+    bool send_snapshot_chunk(const protocol::SnapshotChunk& chunk,
+                             const transport::Endpoint& dest) {
+        std::byte payload_storage[kMaxFrame];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!protocol::encode_snapshot_chunk(chunk, writer)) return false;
+        metrics_.tx_snapshot_chunk++;
+        return send_snapshot_frame(protocol::MessageType::kSnapshot,
+                                   DataView(payload_storage, writer.offset()), dest);
+    }
+
+    bool send_snapshot_end(const protocol::SnapshotEnd& end,
+                           const transport::Endpoint& dest) {
+        std::byte payload_storage[64];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!protocol::encode_snapshot_end(end, writer)) return false;
+        metrics_.tx_snapshot_end++;
+        return send_snapshot_frame(protocol::MessageType::kSnapshot,
+                                   DataView(payload_storage, writer.offset()), dest);
     }
 
     void dispatch(ObjectId object_id, TypeId type_id, SchemaId schema_id, DataView payload,
@@ -1005,8 +1272,11 @@ private:
     protocol::FragmentAssembler assembler_;
     std::atomic<std::uint32_t> next_frame_id_{0};
     std::atomic<std::uint32_t> next_request_id_{0};
+    std::atomic<std::uint32_t> next_snapshot_id_{0};
     std::mutex schema_request_mutex_;
     std::unordered_map<SchemaId, std::chrono::steady_clock::time_point> schema_request_times_;
+    std::map<SnapshotKey, SnapshotStaging> snapshots_;
+    std::mutex snapshot_mutex_;
     static constexpr std::size_t kMaxDatagram = 1400;
     std::atomic<bool> delta_enabled_{false};
     std::shared_mutex typed_mutex_;

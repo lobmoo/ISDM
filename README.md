@@ -171,6 +171,15 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 - 接收端缺失 schema 时自动发 `SchemaRequest`，对端回 `SchemaResponse`（带 `request_id/schema_id`）。
 - 覆盖测试：`./build/tests/isdm/isdm_test_schema_evolution`（V1→V2 追加、V1→V3 类型变更拒绝、SchemaRequest 响应、unknown-schema packed fallback）。
 
+### 快照与重连一致性（M3）
+
+- 晚加入/断线重连：`subscriber.request_snapshot(type_id)`；发布端从有界 `ObjectStateStore` 冻结一份全量，发送 `SnapshotBegin → SnapshotChunk × N → SnapshotEnd`。
+- 接收端 staging，`End` 时校验 `staged_count == expected_count` 和 chunk 覆盖，再按 `timestamp/sequence` 去重应用；缺块、超时、超限都不会把半成品暴露给应用。
+- 实时更新与快照重叠时新值胜出，旧快照对象被丢弃；不会重复回调。
+- 分片 key 为 `(source, frame_id)`，多 publisher 使用相同 frame_id 也不会串包。
+- Delta baseline 来自 store 的最新 full 值；`publish_delta_typed<T>` 在无 baseline 时自动回退 full publish。
+- 覆盖测试：`isdm_test_snapshot_atomicity`、`isdm_test_object_state_store`、`isdm_test_fragment`。
+
 ## 架构概览
 
 ```
@@ -228,7 +237,7 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 - [x] **Phase 1**: 基础框架 (完成)
 - [x] **Phase 2**: 协议层基础 (完成)
 - [x] **Phase 3**: UDP传输 + Discovery (完成)
-- [ ] **Phase 4**: Batch + Delta (进行中；字段级 Delta、分片、M1 复杂类型已完成，对象级 Delta/Snapshot 一致性待做)
+- [ ] **Phase 4**: Batch + Delta (进行中；字段级 Delta、分片、M1 复杂类型、M2 Schema 演进、M3 快照一致性已完成，对象级 Delta/600K 验证待做)
 - [ ] **Phase 5**: Shared Memory
 - [ ] **Phase 6**: 大规模验证 (600K)
 - [ ] **Phase 7**: 高级特性 (Schema Evolution, Security)

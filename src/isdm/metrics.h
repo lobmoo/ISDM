@@ -28,6 +28,17 @@ public:
     std::atomic<std::uint64_t> rx_schema_fallback{0};
     std::atomic<std::uint64_t> rx_schema_mismatch{0};
     std::atomic<std::uint64_t> rx_decode_errors{0};
+    std::atomic<std::uint64_t> tx_snapshot_begin{0};
+    std::atomic<std::uint64_t> tx_snapshot_chunk{0};
+    std::atomic<std::uint64_t> tx_snapshot_end{0};
+    std::atomic<std::uint64_t> rx_snapshot_begin{0};
+    std::atomic<std::uint64_t> rx_snapshot_chunk{0};
+    std::atomic<std::uint64_t> rx_snapshot_end{0};
+    std::atomic<std::uint64_t> snapshot_received{0};
+    std::atomic<std::uint64_t> snapshot_discarded{0};
+    std::atomic<std::uint64_t> snapshot_incomplete{0};
+    std::atomic<std::uint64_t> snapshot_overflow{0};
+    std::atomic<std::uint64_t> snapshot_sender_overflow{0};
 
     struct Snapshot {
         std::uint64_t tx_frames;
@@ -48,6 +59,17 @@ public:
         std::uint64_t rx_schema_fallback;
         std::uint64_t rx_schema_mismatch;
         std::uint64_t rx_decode_errors;
+        std::uint64_t tx_snapshot_begin;
+        std::uint64_t tx_snapshot_chunk;
+        std::uint64_t tx_snapshot_end;
+        std::uint64_t rx_snapshot_begin;
+        std::uint64_t rx_snapshot_chunk;
+        std::uint64_t rx_snapshot_end;
+        std::uint64_t snapshot_received;
+        std::uint64_t snapshot_discarded;
+        std::uint64_t snapshot_incomplete;
+        std::uint64_t snapshot_overflow;
+        std::uint64_t snapshot_sender_overflow;
     };
 
     Snapshot snapshot() const noexcept {
@@ -68,7 +90,18 @@ public:
                         rx_schema_miss.load(std::memory_order_relaxed),
                         rx_schema_fallback.load(std::memory_order_relaxed),
                         rx_schema_mismatch.load(std::memory_order_relaxed),
-                        rx_decode_errors.load(std::memory_order_relaxed)};
+                        rx_decode_errors.load(std::memory_order_relaxed),
+                        tx_snapshot_begin.load(std::memory_order_relaxed),
+                        tx_snapshot_chunk.load(std::memory_order_relaxed),
+                        tx_snapshot_end.load(std::memory_order_relaxed),
+                        rx_snapshot_begin.load(std::memory_order_relaxed),
+                        rx_snapshot_chunk.load(std::memory_order_relaxed),
+                        rx_snapshot_end.load(std::memory_order_relaxed),
+                        snapshot_received.load(std::memory_order_relaxed),
+                        snapshot_discarded.load(std::memory_order_relaxed),
+                        snapshot_incomplete.load(std::memory_order_relaxed),
+                        snapshot_overflow.load(std::memory_order_relaxed),
+                        snapshot_sender_overflow.load(std::memory_order_relaxed)};
     }
 
     void reset() noexcept {
@@ -90,6 +123,17 @@ public:
         rx_schema_fallback = 0;
         rx_schema_mismatch = 0;
         rx_decode_errors = 0;
+        tx_snapshot_begin = 0;
+        tx_snapshot_chunk = 0;
+        tx_snapshot_end = 0;
+        rx_snapshot_begin = 0;
+        rx_snapshot_chunk = 0;
+        rx_snapshot_end = 0;
+        snapshot_received = 0;
+        snapshot_discarded = 0;
+        snapshot_incomplete = 0;
+        snapshot_overflow = 0;
+        snapshot_sender_overflow = 0;
     }
 };
 

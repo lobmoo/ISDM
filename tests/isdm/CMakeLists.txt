@@ -150,6 +150,11 @@ target_link_libraries(isdm_test_object_state_store PRIVATE ISDM::core GTest::gte
 target_compile_features(isdm_test_object_state_store PRIVATE cxx_std_17)
 target_compile_options(isdm_test_object_state_store PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(isdm_test_snapshot_atomicity test_snapshot_atomicity.cc)
+target_link_libraries(isdm_test_snapshot_atomicity PRIVATE ISDM::core GTest::gtest_main)
+target_compile_features(isdm_test_snapshot_atomicity PRIVATE cxx_std_17)
+target_compile_options(isdm_test_snapshot_atomicity PRIVATE -Wall -Wextra -Wpedantic)
+
 include(GoogleTest)
 gtest_discover_tests(isdm_test_types)
 gtest_discover_tests(isdm_test_spsc_queue)
@@ -181,3 +186,4 @@ gtest_discover_tests(isdm_test_complex_types)
 gtest_discover_tests(isdm_test_node_complex)
 gtest_discover_tests(isdm_test_schema_evolution)
 gtest_discover_tests(isdm_test_object_state_store)
+gtest_discover_tests(isdm_test_snapshot_atomicity)
