@@ -153,6 +153,73 @@ node.subscribe_delta(type_id, [](ObjectId oid, TypeId, DataView full, Timestamp)
 });
 ```
 
+### 6.1 复杂类型（M1）
+
+`ISDM_FIELD` 支持嵌套 struct、定长数组、`std::vector` 和 `std::string`。全定长类型仍走原始字节零拷贝；含变长字段的类型走 tagged packed 编码。
+
+```cpp
+namespace app {
+struct Position { float x, y, z; };
+struct Motor {
+    std::uint32_t id;
+    Position position;
+    float samples[8];
+    std::vector<float> waveform;
+    std::string name;
+};
+}  // namespace app
+
+ISDM_STRUCT(app::Position, ISDM_FIELD(app::Position, x), ISDM_FIELD(app::Position, y),
+            ISDM_FIELD(app::Position, z))
+ISDM_STRUCT(app::Motor, ISDM_FIELD(app::Motor, id), ISDM_FIELD(app::Motor, position),
+            ISDM_FIELD(app::Motor, samples), ISDM_FIELD(app::Motor, waveform),
+            ISDM_FIELD(app::Motor, name))
+```
+
+发布端：
+
+```cpp
+node.register_type_typed<app::Motor>(310, 1);
+node.start();
+app::Motor motor{};
+motor.id = 1;
+motor.position = {1, 2, 3};
+motor.samples[0] = 42.0f;
+motor.waveform = {1.5f, 2.5f};
+motor.name = "motor-1";
+node.publish_typed(1, 310, motor);
+```
+
+订阅端（typed）：
+
+```cpp
+sub.subscribe_typed<app::Motor>(310, [](isdm::ObjectId, const app::Motor& motor) {
+    // motor.position / motor.samples / motor.waveform / motor.name 已解码
+});
+```
+
+订阅端（不依赖 C++ 类型）：
+
+```cpp
+sub.subscribe_dynamic(310, [](isdm::ObjectId, const isdm::DynamicObject& obj) {
+    for (const auto& field : obj.fields) {
+        // field.name / field.kind / field.count / field.bytes
+    }
+});
+```
+
+运行 Demo：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DISDM_BUILD_TESTS=OFF -DISDM_BUILD_EXAMPLES=ON -DISDM_BUILD_BENCHMARKS=OFF
+cmake --build build -j"$(nproc)"
+./build/examples/isdm_demo_complex_types
+# 期望：typed=20 dynamic=20，decode_errors=0
+```
+
+注意：wire v0.2，不与 v0.1 节点互操作；复杂类型的 batch/delta、struct 数组/序列和非零默认值本轮尚未实现。
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。

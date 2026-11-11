@@ -134,6 +134,34 @@ int main() {
 }
 ```
 
+### 复杂类型（wire v0.2）
+
+`ISDM_FIELD` 支持嵌套 struct、定长数组、`std::vector` Sequence 和 `std::string`：
+
+```cpp
+struct Position { float x, y, z; };
+struct Motor {
+    std::uint32_t id;
+    Position position;              // 嵌套 struct，展开为 position.x/y/z
+    float samples[8];               // 定长数组
+    std::vector<float> waveform;    // 变长 Sequence
+    std::string name;               // String
+};
+
+ISDM_STRUCT(Position, ISDM_FIELD(Position, x), ISDM_FIELD(Position, y),
+            ISDM_FIELD(Position, z))
+ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
+            ISDM_FIELD(Motor, samples), ISDM_FIELD(Motor, waveform),
+            ISDM_FIELD(Motor, name))
+```
+
+- 全定长类型继续走 `kFixedRaw` 原始字节零拷贝；含 String/Sequence 的类型自动走 `kPacked`（`field_id + length + value` tag）。
+- typed API：`register_type_typed<Motor>(310)`、`publish_typed(1, 310, motor)`、`subscribe_typed<Motor>(310, ...)`。
+- 不依赖 C++ 类型的通用 API：`subscribe_dynamic(310, [](ObjectId, const DynamicObject& obj) { ... })`。
+- 运行 demo：`./build/examples/isdm_demo_complex_types`。
+
+注意：wire v0.2，不与 v0.1 节点互操作；复杂类型的 batch/delta、struct 数组/序列和非零默认值本轮尚未实现。
+
 ## 架构概览
 
 ```
@@ -191,7 +219,7 @@ int main() {
 - [x] **Phase 1**: 基础框架 (完成)
 - [x] **Phase 2**: 协议层基础 (完成)
 - [x] **Phase 3**: UDP传输 + Discovery (完成)
-- [ ] **Phase 4**: Batch + Delta (进行中)
+- [ ] **Phase 4**: Batch + Delta (进行中；字段级 Delta、分片、M1 复杂类型已完成，对象级 Delta/Snapshot 一致性待做)
 - [ ] **Phase 5**: Shared Memory
 - [ ] **Phase 6**: 大规模验证 (600K)
 - [ ] **Phase 7**: 高级特性 (Schema Evolution, Security)
