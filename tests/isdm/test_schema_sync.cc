@@ -42,7 +42,10 @@ MotorSchema make_motor(Version version) {
 
 TEST(SchemaSyncTest, RoundTripsRequest) {
     SchemaRequest request;
+    request.request_id = 42;
+    request.schema_id = 0xDEADBEEF;
     request.type_id = 100;
+    request.version = 3;
 
     std::array<std::byte, 64> storage{};
     ByteWriter writer(MutableDataView(storage.data(), storage.size()));
@@ -51,13 +54,17 @@ TEST(SchemaSyncTest, RoundTripsRequest) {
     SchemaRequest decoded{};
     ByteReader reader(DataView(storage.data(), writer.offset()));
     ASSERT_TRUE(decode_schema_request(reader, decoded));
+    EXPECT_EQ(decoded.request_id, 42U);
+    EXPECT_EQ(decoded.schema_id, 0xDEADBEEFU);
     EXPECT_EQ(decoded.type_id, 100U);
+    EXPECT_EQ(decoded.version, 3U);
 }
 
 TEST(SchemaSyncTest, RoundTripsResponseAndOwnsSchema) {
     const MotorSchema motor = make_motor(3);
 
     SchemaResponse response;
+    response.request_id = 77;
     response.type_id = 100;
     response.schema = motor.desc;
     response.schema_name_table_size = sizeof(kMotorNames);
@@ -69,6 +76,7 @@ TEST(SchemaSyncTest, RoundTripsResponseAndOwnsSchema) {
     SchemaResponse decoded{};
     ByteReader reader(DataView(storage.data(), writer.offset()));
     ASSERT_TRUE(decode_schema_response(reader, decoded));
+    EXPECT_EQ(decoded.request_id, 77U);
     EXPECT_EQ(decoded.type_id, 100U);
     ASSERT_NE(decoded.schema_fields(), nullptr);
     EXPECT_EQ(decoded.field_count(), 2U);
