@@ -1,5 +1,6 @@
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -39,6 +40,30 @@ MotorLayout make_motor_with_offsets(Version version, std::uint32_t offset0,
     m.desc = TypeDescriptor{100U, version, TypeKind::kStruct, 0U, 8U, 2U, m.fields,
                             kMotorNames, layout};
     return m;
+}
+
+// Name table: "Motor\0id\0values\0extra\0"; offsets Motor=0, id=6, values=9,
+// extra=16.
+const char kPackedNames[] = "Motor\0id\0values\0extra\0";
+
+struct PackedLayout {
+    FieldDescriptor fields[3];
+    TypeDescriptor desc;
+};
+
+PackedLayout make_packed(std::uint32_t field_count, bool include_extra,
+                         TypeKind values_element = TypeKind::kFloat32) {
+    PackedLayout p{};
+    p.fields[0] = FieldDescriptor{1U, 6U, TypeKind::kUint32, 0U, 0U, 4U, 0U,
+                                  TypeKind::kUint32, 4U, 0U};
+    p.fields[1] = FieldDescriptor{2U, 9U, TypeKind::kSequence, 0U, 4U, 0U, 0U,
+                                  values_element, 4U, kFieldFlagVariable};
+    p.fields[2] = FieldDescriptor{3U, 16U, TypeKind::kString, 0U, 8U, 0U, 0U,
+                                  TypeKind::kUint8, 1U, kFieldFlagVariable};
+    if (!include_extra) p.fields[2] = FieldDescriptor{};
+    p.desc = TypeDescriptor{100U, 1U, TypeKind::kStruct, 0U, 0U, field_count, p.fields,
+                            kPackedNames, TypeLayout::kPacked};
+    return p;
 }
 
 }  // namespace
@@ -166,6 +191,49 @@ TEST(SchemaRegistryTest, FingerprintChangesWhenSchemaChanges) {
     const auto after = registry.fingerprint(100);
 
     EXPECT_NE(before, after);
+}
+
+TEST(SchemaCompatibilityTest, PackedAppendIsEvolutionCompatible) {
+    auto v1 = make_packed(2U, false);
+    auto v2 = make_packed(3U, true);
+    v1.desc.fields = v1.fields;
+    v2.desc.fields = v2.fields;
+
+    EXPECT_TRUE(schema_evolution_compatible(v1.desc, v2.desc));
+    EXPECT_FALSE(schema_evolution_compatible(v2.desc, v1.desc));
+    EXPECT_TRUE(schema_decode_compatible(v1.desc, v2.desc));
+    EXPECT_TRUE(schema_decode_compatible(v2.desc, v1.desc));
+}
+
+TEST(SchemaCompatibilityTest, PackedChangedKindIsIncompatible) {
+    auto v1 = make_packed(2U, false);
+    auto v3 = make_packed(2U, false, TypeKind::kUint32);
+    v1.desc.fields = v1.fields;
+    v3.desc.fields = v3.fields;
+
+    EXPECT_FALSE(schema_evolution_compatible(v1.desc, v3.desc));
+    EXPECT_FALSE(schema_decode_compatible(v1.desc, v3.desc));
+}
+
+TEST(SchemaCompatibilityTest, PackedReorderIsDecodeCompatible) {
+    auto v1 = make_packed(2U, false);
+    auto reordered = make_packed(2U, false);
+    v1.desc.fields = v1.fields;
+    std::swap(reordered.fields[0], reordered.fields[1]);
+    reordered.desc.fields = reordered.fields;
+
+    EXPECT_TRUE(schema_evolution_compatible(v1.desc, reordered.desc));
+    EXPECT_TRUE(schema_decode_compatible(v1.desc, reordered.desc));
+}
+
+TEST(SchemaCompatibilityTest, FixedRawRequiresExactDescriptor) {
+    auto a = make_motor_with_offsets(1U, 0U, 4U, TypeLayout::kFixedRaw);
+    auto b = make_motor_with_offsets(1U, 8U, 12U, TypeLayout::kFixedRaw);
+    a.desc.fields = a.fields;
+    b.desc.fields = b.fields;
+
+    EXPECT_FALSE(schema_decode_compatible(a.desc, b.desc));
+    EXPECT_FALSE(schema_evolution_compatible(a.desc, b.desc));
 }
 
 TEST(SchemaRegistryTest, ConcurrentReadsAreSafe) {
