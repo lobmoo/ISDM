@@ -20,6 +20,7 @@ public:
     std::atomic<std::uint64_t> rx_dropped{0};
     std::atomic<std::uint64_t> rx_objects{0};
     std::atomic<std::uint64_t> rx_schema_updates{0};
+    std::atomic<std::uint64_t> rx_schema_miss{0};
     std::atomic<std::uint64_t> rx_decode_errors{0};
 
     struct Snapshot {
@@ -33,6 +34,7 @@ public:
         std::uint64_t rx_dropped;
         std::uint64_t rx_objects;
         std::uint64_t rx_schema_updates;
+        std::uint64_t rx_schema_miss;
         std::uint64_t rx_decode_errors;
     };
 
@@ -47,6 +49,7 @@ public:
                         rx_dropped.load(std::memory_order_relaxed),
                         rx_objects.load(std::memory_order_relaxed),
                         rx_schema_updates.load(std::memory_order_relaxed),
+                        rx_schema_miss.load(std::memory_order_relaxed),
                         rx_decode_errors.load(std::memory_order_relaxed)};
     }
 
@@ -61,6 +64,7 @@ public:
         rx_dropped = 0;
         rx_objects = 0;
         rx_schema_updates = 0;
+        rx_schema_miss = 0;
         rx_decode_errors = 0;
     }
 };

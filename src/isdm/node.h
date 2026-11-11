@@ -273,21 +273,45 @@ public:
         by_type_.emplace_back(type_id, std::move(cb));
     }
 
-    // Convenience: subscribe with a typed callback. The payload is decoded into
-    // T when its size matches exactly; otherwise the callback is skipped.
+    // Convenience: subscribe with a reflected typed callback. The payload is
+    // decoded with ObjectCodec; failures increment rx_decode_errors.
     template <typename T>
     void subscribe_typed(TypeId type_id, std::function<void(ObjectId, const T&)> cb) {
-        static_assert(std::is_trivially_copyable<T>::value,
-                      "subscribe_typed requires a trivially copyable type");
-        subscribe(
-            type_id,
-            [cb = std::move(cb)](ObjectId object_id, TypeId, DataView payload, Timestamp) {
-                if (payload.size() == sizeof(T) && cb) {
-                    T value{};
-                    std::memcpy(&value, payload.data(), sizeof(T));
-                    cb(object_id, value);
-                }
-            });
+        auto type = typed_type<T>(type_id);
+        subscribe(type_id,
+                  [this, type, cb = std::move(cb)](ObjectId object_id, TypeId, DataView payload,
+                                                   Timestamp) {
+                      if (!cb) return;
+                      T value{};
+                      ByteReader reader(payload);
+                      if (ObjectCodec::decode(*type, reader, &value)) {
+                          cb(object_id, value);
+                      } else {
+                          metrics_.rx_decode_errors++;
+                      }
+                  });
+    }
+
+    // Dynamic subscribe: the callback receives field views into the payload.
+    // The descriptor is looked up at callback time so a late schema works.
+    void subscribe_dynamic(
+        TypeId type_id,
+        std::function<void(ObjectId, const DynamicObject&)> cb) {
+        subscribe(type_id, [this, cb = std::move(cb)](ObjectId object_id, TypeId tid,
+                                                      DataView payload, Timestamp) {
+            if (!cb) return;
+            const TypeDescriptor* descriptor = registry().find(tid);
+            if (descriptor == nullptr) {
+                metrics_.rx_schema_miss++;
+                return;
+            }
+            DynamicObject obj;
+            if (!ObjectCodec::decode_dynamic(*descriptor, payload, obj)) {
+                metrics_.rx_decode_errors++;
+                return;
+            }
+            cb(object_id, obj);
+        });
     }
 
     // Delta subscription: the callback always receives the FULL current value.
@@ -459,6 +483,23 @@ private:
         }
         dispatch(delta.object_id, delta.type_id, DataView(cached.data(), cached.size()),
                  delta.timestamp);
+    }
+
+    // Returns the cached local reflection table, building it from describe<T>()
+    // on first use. Subscribers may use this without registering the type.
+    template <typename T>
+    std::shared_ptr<ReflectedType> typed_type(TypeId type_id) {
+        {
+            std::shared_lock<std::shared_mutex> lock(typed_mutex_);
+            const auto it = typed_types_.find(type_id);
+            if (it != typed_types_.end()) return it->second;
+        }
+        auto ref = std::make_shared<ReflectedType>(describe<T>(type_id));
+        std::unique_lock<std::shared_mutex> lock(typed_mutex_);
+        const auto it = typed_types_.find(type_id);
+        if (it != typed_types_.end()) return it->second;
+        typed_types_[type_id] = ref;
+        return ref;
     }
 
     // Builds a data frame with the requested schema identity, retains the
