@@ -103,4 +103,10 @@ TEST(ReflectTest, DefaultVersionIsOne) {
     EXPECT_EQ(ref.descriptor().version, 1U);
 }
 
+TEST(ReflectTest, ExistingMotorStaysFixedRaw) {
+    const auto ref = isdm::describe<reflect_test::Motor>(100, 1);
+    EXPECT_EQ(ref.descriptor().layout, TypeLayout::kFixedRaw);
+    EXPECT_EQ(ref.descriptor().field_count, 4U);
+}
+
 }  // namespace isdm::test
