@@ -16,6 +16,8 @@ namespace {
 using isdm::protocol::DecodedSchema;
 using isdm::protocol::decode_schema;
 using isdm::protocol::encode_schema;
+using isdm::protocol::kSchemaMagic;
+using isdm::protocol::kSchemaWireVersion;
 
 // name table: "Motor\0speed\0current\0"; offsets Motor=0, speed=6, current=12
 constexpr char kMotorNames[] = "Motor\0speed\0current\0";
@@ -28,9 +30,12 @@ struct MotorSchema {
 
 MotorSchema make_motor(Version version) {
     MotorSchema s{};
-    s.fields[0] = FieldDescriptor{1U, 6U, TypeKind::kFloat32, 0U, 0U, 4U, 0U};
-    s.fields[1] = FieldDescriptor{2U, 12U, TypeKind::kFloat32, 0U, 4U, 4U, 0U};
-    s.desc = TypeDescriptor{100U, version, TypeKind::kStruct, 0U, 8U, 2U, s.fields, kMotorNames};
+    s.fields[0] = FieldDescriptor{1U, 6U, TypeKind::kFloat32, 0U, 0U, 4U, 0U,
+                                  TypeKind::kFloat32, 4U, 0U};
+    s.fields[1] = FieldDescriptor{2U, 12U, TypeKind::kFloat32, 0U, 4U, 4U, 0U,
+                                  TypeKind::kFloat32, 4U, 0U};
+    s.desc = TypeDescriptor{100U, version, TypeKind::kStruct, 0U, 8U, 2U, s.fields,
+                            kMotorNames, TypeLayout::kFixedRaw};
     return s;
 }
 
@@ -51,13 +56,42 @@ TEST(SchemaWireTest, RoundTripsSchema) {
     EXPECT_EQ(decoded.desc.type_id, 100U);
     EXPECT_EQ(decoded.desc.version, 1U);
     EXPECT_EQ(decoded.desc.kind, TypeKind::kStruct);
+    EXPECT_EQ(decoded.desc.layout, TypeLayout::kFixedRaw);
     EXPECT_EQ(decoded.desc.fixed_size, 8U);
     EXPECT_EQ(decoded.desc.field_count, 2U);
     EXPECT_EQ(decoded.desc.fields[0].field_id, 1U);
     EXPECT_EQ(decoded.desc.fields[1].field_id, 2U);
+    EXPECT_EQ(decoded.desc.fields[0].element_kind, TypeKind::kFloat32);
+    EXPECT_EQ(decoded.desc.fields[0].element_size, 4U);
     EXPECT_STREQ(decoded.type_name(), "Motor");
     EXPECT_STREQ(decoded.field_name(0), "speed");
     EXPECT_STREQ(decoded.field_name(1), "current");
+}
+
+TEST(SchemaWireTest, RoundTripsExtendedFieldMetadata) {
+    MotorSchema motor = make_motor(4);
+    motor.desc.layout = TypeLayout::kPacked;
+    motor.fields[1].kind = TypeKind::kSequence;
+    motor.fields[1].element_kind = TypeKind::kFloat32;
+    motor.fields[1].element_size = 4U;
+    motor.fields[1].size = 0U;
+    motor.fields[1].array_length = 0U;
+    motor.fields[1].flags = kFieldFlagVariable;
+
+    std::array<std::byte, 256> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    ASSERT_TRUE(encode_schema(motor.desc, writer));
+
+    DecodedSchema decoded;
+    ByteReader reader(DataView(storage.data(), writer.offset()));
+    ASSERT_TRUE(decode_schema(reader, decoded));
+    EXPECT_EQ(decoded.desc.layout, TypeLayout::kPacked);
+    ASSERT_EQ(decoded.desc.field_count, 2U);
+    EXPECT_EQ(decoded.desc.fields[1].kind, TypeKind::kSequence);
+    EXPECT_EQ(decoded.desc.fields[1].element_kind, TypeKind::kFloat32);
+    EXPECT_EQ(decoded.desc.fields[1].element_size, 4U);
+    EXPECT_EQ(decoded.desc.fields[1].flags, kFieldFlagVariable);
+    EXPECT_TRUE(field_is_variable(decoded.desc.fields[1]));
 }
 
 TEST(SchemaWireTest, RoundTripsSchemaWithoutFields) {
@@ -93,8 +127,7 @@ TEST(SchemaWireTest, DecodedSchemaRegistersIntoRegistry) {
     ASSERT_TRUE(registry.register_type(decoded.desc, decoded.name_table.size()));
     const TypeDescriptor* found = registry.find(100);
     ASSERT_NE(found, nullptr);
-    EXPECT_EQ(registry.fingerprint(100), registry.fingerprint(100));
-    EXPECT_FALSE(registry.fingerprint(100) == 0U);
+    EXPECT_NE(registry.fingerprint(100), 0U);
 }
 
 TEST(SchemaWireTest, FingerprintMatchesSourceRegistry) {
@@ -133,10 +166,24 @@ TEST(SchemaWireTest, RejectsUnmatchingMagic) {
     EXPECT_FALSE(decode_schema(reader, decoded));
 }
 
+TEST(SchemaWireTest, RejectsWrongWireVersion) {
+    const MotorSchema motor = make_motor(1);
+    std::array<std::byte, 256> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    ASSERT_TRUE(encode_schema(motor.desc, writer));
+    storage[2] = std::byte{1};  // magic u16 then wire version
+
+    DecodedSchema decoded;
+    ByteReader reader(DataView(storage.data(), writer.offset()));
+    EXPECT_FALSE(decode_schema(reader, decoded));
+}
+
 TEST(SchemaWireTest, RejectsHugeFieldCount) {
     std::array<std::byte, 64> storage{};
     ByteWriter writer(MutableDataView(storage.data(), storage.size()));
-    writer.write<std::uint16_t>(isdm::protocol::kSchemaMagic);
+    writer.write<std::uint16_t>(kSchemaMagic);
+    writer.write<std::uint8_t>(kSchemaWireVersion);
+    writer.write<std::uint8_t>(static_cast<std::uint8_t>(TypeLayout::kFixedRaw));
     writer.write<std::uint32_t>(100);
     writer.write<std::uint32_t>(1);
     writer.write<std::uint8_t>(static_cast<std::uint8_t>(TypeKind::kStruct));

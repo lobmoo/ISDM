@@ -29,9 +29,12 @@ struct MotorSchema {
 
 MotorSchema make_motor(Version version) {
     MotorSchema s{};
-    s.fields[0] = FieldDescriptor{1U, 6U, TypeKind::kFloat32, 0U, 0U, 4U, 0U};
-    s.fields[1] = FieldDescriptor{2U, 12U, TypeKind::kFloat32, 0U, 4U, 4U, 0U};
-    s.desc = TypeDescriptor{100U, version, TypeKind::kStruct, 0U, 8U, 2U, s.fields, kMotorNames};
+    s.fields[0] = FieldDescriptor{1U, 6U, TypeKind::kFloat32, 0U, 0U, 4U, 0U,
+                                  TypeKind::kFloat32, 4U, 0U};
+    s.fields[1] = FieldDescriptor{2U, 12U, TypeKind::kFloat32, 0U, 4U, 4U, 0U,
+                                  TypeKind::kFloat32, 4U, 0U};
+    s.desc = TypeDescriptor{100U, version, TypeKind::kStruct, 0U, 8U, 2U, s.fields,
+                            kMotorNames, TypeLayout::kFixedRaw};
     return s;
 }
 

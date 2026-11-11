@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -14,6 +15,73 @@
 
 namespace isdm {
 
+namespace detail {
+
+inline void hash_bytes(std::uint64_t& hash, const void* data, std::size_t size) noexcept {
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    for (std::size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+}
+
+inline void hash_string(std::uint64_t& hash, const char* text) noexcept {
+    if (text == nullptr) {
+        hash_bytes(hash, "", 1);
+        return;
+    }
+    hash_bytes(hash, text, std::strlen(text) + 1U);
+}
+
+}  // namespace detail
+
+// Wire-identity fingerprint.
+//
+// kFixedRaw describes raw C++ object bytes, so offsets and fixed_size are part
+// of the wire identity. kPacked is descriptor/tag driven, so offsets,
+// name-table offsets, and the local C++ fixed_size are intentionally excluded;
+// the same logical packed schema fingerprints identically across ABIs.
+inline SchemaId schema_fingerprint(const TypeDescriptor& descriptor) noexcept {
+    std::uint64_t hash = 14695981039346656037ULL;
+    const std::uint32_t format = 1;  // fingerprint algorithm version
+    detail::hash_bytes(hash, &format, sizeof(format));
+    detail::hash_bytes(hash, &descriptor.type_id, sizeof(descriptor.type_id));
+    detail::hash_bytes(hash, &descriptor.version, sizeof(descriptor.version));
+    detail::hash_bytes(hash, &descriptor.kind, sizeof(descriptor.kind));
+    detail::hash_bytes(hash, &descriptor.layout, sizeof(descriptor.layout));
+    if (descriptor.layout == TypeLayout::kFixedRaw) {
+        detail::hash_bytes(hash, &descriptor.fixed_size, sizeof(descriptor.fixed_size));
+    }
+    detail::hash_string(hash, descriptor.name_table == nullptr
+                                 ? nullptr
+                                 : descriptor.name_table + descriptor.name_offset);
+    detail::hash_bytes(hash, &descriptor.field_count, sizeof(descriptor.field_count));
+
+    // Field order is significant for packed encoding; never sort here.
+    for (std::uint32_t i = 0; i < descriptor.field_count; ++i) {
+        const FieldDescriptor& field = descriptor.fields[i];
+        const TypeKind element_kind = field_element_kind(field);
+        const std::uint32_t element_size = field_element_size(field);
+        const std::uint8_t variable = field_is_variable(field) ? 1U : 0U;
+
+        detail::hash_bytes(hash, &field.field_id, sizeof(field.field_id));
+        detail::hash_bytes(hash, &field.kind, sizeof(field.kind));
+        detail::hash_bytes(hash, &element_kind, sizeof(element_kind));
+        detail::hash_bytes(hash, &field.referenced_type_id, sizeof(field.referenced_type_id));
+        detail::hash_bytes(hash, &field.size, sizeof(field.size));
+        detail::hash_bytes(hash, &field.array_length, sizeof(field.array_length));
+        detail::hash_bytes(hash, &element_size, sizeof(element_size));
+        detail::hash_bytes(hash, &variable, sizeof(variable));
+        if (descriptor.layout == TypeLayout::kFixedRaw) {
+            detail::hash_bytes(hash, &field.offset, sizeof(field.offset));
+        }
+        detail::hash_string(hash, descriptor.name_table == nullptr
+                                     ? nullptr
+                                     : descriptor.name_table + field.name_offset);
+    }
+    return static_cast<SchemaId>(hash ^ (hash >> 32U));
+}
+
 class SchemaRegistry {
 public:
     explicit SchemaRegistry(std::size_t arena_capacity = 1U << 20)
@@ -25,13 +93,30 @@ public:
     bool register_type(const TypeDescriptor& descriptor, std::size_t name_table_size) {
         if (descriptor.type_id == 0 || descriptor.version == 0 ||
             (descriptor.field_count != 0U && descriptor.fields == nullptr) ||
-            (name_table_size != 0U && descriptor.name_table == nullptr)) {
+            descriptor.name_table == nullptr || name_table_size == 0U) {
             return false;
         }
+        if (descriptor.layout != TypeLayout::kFixedRaw &&
+            descriptor.layout != TypeLayout::kPacked) {
+            return false;
+        }
+        for (std::uint32_t i = 0; i < descriptor.field_count; ++i) {
+            if (descriptor.fields[i].field_id == 0) return false;
+            for (std::uint32_t j = i + 1; j < descriptor.field_count; ++j) {
+                if (descriptor.fields[i].field_id == descriptor.fields[j].field_id) {
+                    return false;
+                }
+            }
+        }
 
+        const SchemaId fingerprint = schema_fingerprint(descriptor);
         std::unique_lock<std::shared_mutex> lock(mutex_);
         const Key key{descriptor.type_id, descriptor.version};
         if (entries_.find(key) != entries_.end()) return false;
+        // Keep the first descriptor for a wire identity. A remote packed
+        // descriptor with the same fingerprint but different local offsets is
+        // therefore a no-op rather than a replacement.
+        if (by_fingerprint_.find(fingerprint) != by_fingerprint_.end()) return false;
 
         auto* stored = arena_.make<TypeDescriptor>(descriptor);
         if (stored == nullptr) return false;
@@ -46,16 +131,14 @@ public:
                         sizeof(FieldDescriptor) * descriptor.field_count);
         }
 
-        char* names = nullptr;
-        if (name_table_size != 0U) {
-            names = static_cast<char*>(arena_.allocate(name_table_size, alignof(char)));
-            if (names == nullptr) return false;
-            std::memcpy(names, descriptor.name_table, name_table_size);
-        }
+        char* names = static_cast<char*>(arena_.allocate(name_table_size, alignof(char)));
+        if (names == nullptr) return false;
+        std::memcpy(names, descriptor.name_table, name_table_size);
 
         stored->fields = fields;
         stored->name_table = names;
         entries_.emplace(key, stored);
+        by_fingerprint_.emplace(fingerprint, stored);
         return true;
     }
 
@@ -77,9 +160,20 @@ public:
         return it == entries_.end() ? nullptr : it->second;
     }
 
+    const TypeDescriptor* find_by_fingerprint(SchemaId fingerprint) const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        const auto it = by_fingerprint_.find(fingerprint);
+        return it == by_fingerprint_.end() ? nullptr : it->second;
+    }
+
     SchemaId fingerprint(TypeId type_id) const {
-        const auto* descriptor = find(type_id);
-        return descriptor == nullptr ? 0U : fingerprint(*descriptor);
+        const TypeDescriptor* descriptor = find(type_id);
+        return descriptor == nullptr ? 0U : schema_fingerprint(*descriptor);
+    }
+
+    SchemaId fingerprint(TypeId type_id, Version version) const {
+        const TypeDescriptor* descriptor = find(type_id, version);
+        return descriptor == nullptr ? 0U : schema_fingerprint(*descriptor);
     }
 
     std::size_t type_count() const {
@@ -91,7 +185,6 @@ public:
     template <typename F>
     void for_each_type(F&& f) const {
         std::shared_lock<std::shared_mutex> lock(mutex_);
-        // Latest version per TypeId.
         std::unordered_map<TypeId, const TypeDescriptor*> latest;
         for (const auto& entry : entries_) {
             const auto it = latest.find(entry.first.type_id);
@@ -123,49 +216,10 @@ private:
         }
     };
 
-    static void hash_bytes(std::uint64_t& hash, const void* data, std::size_t size) noexcept {
-        const auto* bytes = static_cast<const std::uint8_t*>(data);
-        for (std::size_t i = 0; i < size; ++i) {
-            hash ^= bytes[i];
-            hash *= 1099511628211ULL;
-        }
-    }
-
-    static SchemaId fingerprint(const TypeDescriptor& descriptor) {
-        std::uint64_t hash = 14695981039346656037ULL;
-        hash_bytes(hash, &descriptor.type_id, sizeof(descriptor.type_id));
-        hash_bytes(hash, &descriptor.version, sizeof(descriptor.version));
-        hash_bytes(hash, &descriptor.kind, sizeof(descriptor.kind));
-        hash_bytes(hash, &descriptor.fixed_size, sizeof(descriptor.fixed_size));
-        hash_bytes(hash, &descriptor.field_count, sizeof(descriptor.field_count));
-
-        std::vector<const FieldDescriptor*> fields;
-        fields.reserve(descriptor.field_count);
-        for (std::uint32_t i = 0; i < descriptor.field_count; ++i) {
-            fields.push_back(&descriptor.fields[i]);
-        }
-        std::sort(fields.begin(), fields.end(), [](const auto* lhs, const auto* rhs) {
-            return lhs->field_id < rhs->field_id;
-        });
-
-        for (const auto* field : fields) {
-            hash_bytes(hash, &field->field_id, sizeof(field->field_id));
-            hash_bytes(hash, &field->kind, sizeof(field->kind));
-            hash_bytes(hash, &field->referenced_type_id, sizeof(field->referenced_type_id));
-            hash_bytes(hash, &field->offset, sizeof(field->offset));
-            hash_bytes(hash, &field->size, sizeof(field->size));
-            hash_bytes(hash, &field->array_length, sizeof(field->array_length));
-            if (descriptor.name_table != nullptr) {
-                const auto* name = descriptor.name_table + field->name_offset;
-                hash_bytes(hash, name, std::strlen(name) + 1U);
-            }
-        }
-        return static_cast<SchemaId>(hash ^ (hash >> 32U));
-    }
-
     mutable std::shared_mutex mutex_;
     ArenaAllocator arena_;
     std::unordered_map<Key, TypeDescriptor*, KeyHash> entries_;
+    std::unordered_map<SchemaId, const TypeDescriptor*> by_fingerprint_;
 };
 
 }  // namespace isdm

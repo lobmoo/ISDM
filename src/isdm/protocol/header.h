@@ -9,7 +9,8 @@ namespace isdm::protocol {
 
 constexpr std::uint16_t kMagic = 0x4953;  // "IS"
 constexpr std::uint8_t kVersionMajor = 0;
-constexpr std::uint8_t kVersionMinor = 1;
+// Wire v0.2 adds TypeLayout and packed field metadata to the schema frame.
+constexpr std::uint8_t kVersionMinor = 2;
 
 // Fixed little-endian header size (38 bytes).
 constexpr std::size_t kHeaderSize = 38;

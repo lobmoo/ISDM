@@ -23,12 +23,16 @@ struct Point {
 constexpr char kPointNames[] = "Point\0x\0y\0z\0";
 
 TypeDescriptor make_point_desc() {
-    FieldDescriptor fields[3] = {
-        FieldDescriptor{1U, 6U, TypeKind::kFloat32, 0U, 0U, 4U, 0U},
-        FieldDescriptor{2U, 8U, TypeKind::kFloat32, 0U, 4U, 4U, 0U},
-        FieldDescriptor{3U, 10U, TypeKind::kFloat32, 0U, 8U, 4U, 0U},
+    static FieldDescriptor fields[3] = {
+        FieldDescriptor{1U, 6U, TypeKind::kFloat32, 0U, 0U, 4U, 0U, TypeKind::kFloat32, 4U,
+                        0U},
+        FieldDescriptor{2U, 8U, TypeKind::kFloat32, 0U, 4U, 4U, 0U, TypeKind::kFloat32, 4U,
+                        0U},
+        FieldDescriptor{3U, 10U, TypeKind::kFloat32, 0U, 8U, 4U, 0U, TypeKind::kFloat32, 4U,
+                        0U},
     };
-    return TypeDescriptor{200U, 1U, TypeKind::kStruct, 0U, sizeof(Point), 3U, fields, kPointNames};
+    return TypeDescriptor{200U, 1U, TypeKind::kStruct, 0U, sizeof(Point), 3U, fields,
+                          kPointNames, TypeLayout::kFixedRaw};
 }
 
 }  // namespace
