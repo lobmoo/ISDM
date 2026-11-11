@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include "isdm/codec/object_codec.h"
 #include "isdm/core/types.h"
 #include "isdm/reflect.h"
 
@@ -169,6 +170,158 @@ TEST(ComplexReflectTest, NestedFieldIdsAreUnique) {
     }
     std::sort(ids.begin(), ids.end());
     EXPECT_EQ(std::adjacent_find(ids.begin(), ids.end()), ids.end());
+}
+
+TEST(ObjectCodecTest, PackedTypedRoundTrip) {
+    const auto ref = isdm::describe<complex_test::Motor>(310, 1);
+    complex_test::Motor in{};
+    in.id = 7;
+    in.position = {1.0f, 2.0f, 3.0f};
+    for (int i = 0; i < 8; ++i) in.samples[i] = static_cast<float>(i);
+    in.gains = {10.0f, 20.0f, 30.0f, 40.0f};
+    in.waveform = {1.5f, 2.5f, 3.5f};
+    in.name = "motor-7";
+
+    std::array<std::byte, 1024> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    ASSERT_TRUE(ObjectCodec::encode(ref, &in, writer));
+
+    complex_test::Motor out{};
+    ByteReader reader(DataView(storage.data(), writer.offset()));
+    ASSERT_TRUE(ObjectCodec::decode(ref, reader, &out));
+    EXPECT_EQ(out.id, in.id);
+    EXPECT_EQ(out.position.x, in.position.x);
+    EXPECT_EQ(out.position.z, in.position.z);
+    EXPECT_EQ(out.samples[7], in.samples[7]);
+    EXPECT_EQ(out.gains[3], in.gains[3]);
+    EXPECT_EQ(out.waveform, in.waveform);
+    EXPECT_EQ(out.name, in.name);
+}
+
+TEST(ObjectCodecTest, EmptyStringAndSequence) {
+    const auto ref = isdm::describe<complex_test::Motor>(310, 1);
+    complex_test::Motor in{};
+    in.name = "";
+    in.waveform.clear();
+
+    std::array<std::byte, 512> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    ASSERT_TRUE(ObjectCodec::encode(ref, &in, writer));
+
+    complex_test::Motor out{};
+    out.name = "should-be-overwritten";
+    out.waveform = {9.0f};
+    ByteReader reader(DataView(storage.data(), writer.offset()));
+    ASSERT_TRUE(ObjectCodec::decode(ref, reader, &out));
+    EXPECT_TRUE(out.name.empty());
+    EXPECT_TRUE(out.waveform.empty());
+}
+
+TEST(ObjectCodecTest, FixedRawRoundTrip) {
+    const auto ref = isdm::describe<complex_test::Position>(312, 1);
+    complex_test::Position in{1.0f, 2.0f, 3.0f};
+    std::array<std::byte, 64> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    ASSERT_TRUE(ObjectCodec::encode(ref, &in, writer));
+    EXPECT_EQ(writer.offset(), sizeof(complex_test::Position));
+
+    complex_test::Position out{};
+    ByteReader reader(DataView(storage.data(), writer.offset()));
+    ASSERT_TRUE(ObjectCodec::decode(ref, reader, &out));
+    EXPECT_EQ(out.y, 2.0f);
+}
+
+TEST(ObjectCodecTest, DecodeDynamicFields) {
+    const auto ref = isdm::describe<complex_test::Motor>(310, 1);
+    complex_test::Motor in{};
+    in.id = 7;
+    in.position.y = 2.0f;
+    in.waveform = {1.5f, 2.5f};
+    in.name = "m";
+
+    std::array<std::byte, 1024> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    ASSERT_TRUE(ObjectCodec::encode(ref, &in, writer));
+
+    DynamicObject obj;
+    ASSERT_TRUE(ObjectCodec::decode_dynamic(ref.descriptor(),
+                                            DataView(storage.data(), writer.offset()), obj));
+    ASSERT_EQ(obj.fields.size(), 8U);
+    EXPECT_EQ(obj.fields[1].name, "position.x");
+    EXPECT_EQ(obj.fields[1].kind, TypeKind::kFloat32);
+    EXPECT_EQ(obj.fields[6].name, "waveform");
+    EXPECT_EQ(obj.fields[6].count, 2U);
+    EXPECT_EQ(obj.fields[7].name, "name");
+    EXPECT_EQ(obj.fields[7].count, 1U);
+}
+
+TEST(ObjectCodecTest, RejectsTruncatedAndOverflowingPayloads) {
+    const auto ref = isdm::describe<complex_test::Motor>(310, 1);
+    complex_test::Motor in{};
+    in.name = "abc";
+    std::array<std::byte, 256> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    ASSERT_TRUE(ObjectCodec::encode(ref, &in, writer));
+
+    complex_test::Motor out{};
+    for (std::size_t cut = 0; cut < writer.offset(); cut += 7) {
+        ByteReader reader(DataView(storage.data(), cut));
+        EXPECT_FALSE(ObjectCodec::decode(ref, reader, &out));
+    }
+
+    storage[0] = std::byte{0x00};
+    ByteReader bad_magic(DataView(storage.data(), writer.offset()));
+    EXPECT_FALSE(ObjectCodec::decode(ref, bad_magic, &out));
+
+    std::array<std::byte, 64> huge{};
+    ByteWriter hw(MutableDataView(huge.data(), huge.size()));
+    hw.write(kPackedMagic);
+    hw.write<std::uint16_t>(1);
+    hw.write<std::uint32_t>(ref.descriptor().fields[0].field_id);
+    hw.write<std::uint32_t>(0xFFFFFFFFu);
+    ByteReader hr(DataView(huge.data(), hw.offset()));
+    EXPECT_FALSE(ObjectCodec::decode(ref, hr, &out));
+}
+
+TEST(ObjectCodecTest, SkipsUnknownFieldAndZeroDefaultsMissingField) {
+    const auto ref = isdm::describe<complex_test::Motor>(310, 1);
+
+    std::array<std::byte, 256> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    writer.write(kPackedMagic);
+    writer.write<std::uint16_t>(2);
+    writer.write<std::uint32_t>(ref.descriptor().fields[0].field_id);
+    writer.write<std::uint32_t>(4);
+    const std::uint32_t id = 42;
+    writer.write_bytes(&id, sizeof(id));
+    writer.write<std::uint32_t>(0xDEADBEEF);
+    writer.write<std::uint32_t>(3);
+    writer.write_bytes("xyz", 3);
+
+    complex_test::Motor out{};
+    ByteReader reader(DataView(storage.data(), writer.offset()));
+    ASSERT_TRUE(ObjectCodec::decode(ref, reader, &out));
+    EXPECT_EQ(out.id, 42U);
+    EXPECT_TRUE(out.name.empty());
+    EXPECT_TRUE(out.waveform.empty());
+}
+
+TEST(ObjectCodecTest, DynamicEncodeZeroDefaults) {
+    const auto ref = isdm::describe<complex_test::Motor>(310, 1);
+    DynamicObject obj;
+    obj.type_id = 310;
+    obj.descriptor = &ref.descriptor();
+
+    std::array<std::byte, 512> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    ASSERT_TRUE(ObjectCodec::encode_dynamic(ref.descriptor(), obj, writer));
+
+    complex_test::Motor out{};
+    ByteReader reader(DataView(storage.data(), writer.offset()));
+    ASSERT_TRUE(ObjectCodec::decode(ref, reader, &out));
+    EXPECT_EQ(out.id, 0U);
+    EXPECT_TRUE(out.name.empty());
+    EXPECT_TRUE(out.waveform.empty());
 }
 
 }  // namespace isdm::test
