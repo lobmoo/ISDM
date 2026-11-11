@@ -95,6 +95,11 @@ public:
     template <typename T>
     bool register_type_typed(TypeId type_id, Version version = 1) {
         auto ref = describe<T>(type_id, version);
+        const TypeDescriptor* previous = registry_.find(type_id);
+        if (previous != nullptr) {
+            if (version <= previous->version) return false;
+            if (!schema_evolution_compatible(*previous, ref.descriptor())) return false;
+        }
         if (!register_type(ref.descriptor(), ref.name_table_size())) return false;
         auto shared = std::make_shared<ReflectedType>(std::move(ref));
         std::unique_lock<std::shared_mutex> lock(typed_mutex_);
@@ -274,44 +279,61 @@ public:
     }
 
     // Convenience: subscribe with a reflected typed callback. The payload is
-    // decoded with ObjectCodec; failures increment rx_decode_errors.
+    // decoded with ObjectCodec; schema_id is checked for version compatibility.
     template <typename T>
     void subscribe_typed(TypeId type_id, std::function<void(ObjectId, const T&)> cb) {
         auto type = typed_type<T>(type_id);
-        subscribe(type_id,
-                  [this, type, cb = std::move(cb)](ObjectId object_id, TypeId, DataView payload,
-                                                   Timestamp) {
-                      if (!cb) return;
-                      T value{};
-                      ByteReader reader(payload);
-                      if (ObjectCodec::decode(*type, reader, &value)) {
-                          cb(object_id, value);
-                      } else {
-                          metrics_.rx_decode_errors++;
-                      }
-                  });
+        subscribe_schema_aware(
+            type_id, [this, type, cb = std::move(cb)](const IncomingObject& in) {
+                if (!cb) return;
+                if (!typed_schema_ok(*type, in)) return;
+                T value{};
+                ByteReader reader(in.payload);
+                if (ObjectCodec::decode(*type, reader, &value)) {
+                    cb(in.object_id, value);
+                } else {
+                    metrics_.rx_decode_errors++;
+                }
+            });
     }
 
     // Dynamic subscribe: the callback receives field views into the payload.
-    // The descriptor is looked up at callback time so a late schema works.
+    // The descriptor is selected by sender schema_id when known.
     void subscribe_dynamic(
         TypeId type_id,
         std::function<void(ObjectId, const DynamicObject&)> cb) {
-        subscribe(type_id, [this, cb = std::move(cb)](ObjectId object_id, TypeId tid,
-                                                      DataView payload, Timestamp) {
-            if (!cb) return;
-            const TypeDescriptor* descriptor = registry().find(tid);
-            if (descriptor == nullptr) {
-                metrics_.rx_schema_miss++;
-                return;
-            }
-            DynamicObject obj;
-            if (!ObjectCodec::decode_dynamic(*descriptor, payload, obj)) {
-                metrics_.rx_decode_errors++;
-                return;
-            }
-            cb(object_id, obj);
-        });
+        subscribe_schema_aware(
+            type_id, [this, cb = std::move(cb)](const IncomingObject& in) {
+                if (!cb) return;
+                const TypeDescriptor* descriptor =
+                    in.schema_id != 0 ? registry().find_by_fingerprint(in.schema_id)
+                                      : nullptr;
+                if (descriptor == nullptr) {
+                    descriptor = registry().find(in.type_id);
+                    if (descriptor == nullptr) {
+                        metrics_.rx_schema_miss++;
+                        if (in.schema_id != 0) {
+                            request_schema(in.schema_id, in.type_id, 0, in.source);
+                        }
+                        return;
+                    }
+                    if (in.schema_id != 0) {
+                        if (descriptor->layout == TypeLayout::kPacked) {
+                            metrics_.rx_schema_fallback++;
+                        } else {
+                            metrics_.rx_schema_miss++;
+                            request_schema(in.schema_id, in.type_id, 0, in.source);
+                            return;
+                        }
+                    }
+                }
+                DynamicObject obj;
+                if (!ObjectCodec::decode_dynamic(*descriptor, in.payload, obj)) {
+                    metrics_.rx_decode_errors++;
+                    return;
+                }
+                cb(in.object_id, obj);
+            });
     }
 
     // Delta subscription: the callback always receives the FULL current value.
@@ -368,6 +390,16 @@ public:
     }
 
 private:
+    struct IncomingObject {
+        ObjectId object_id = 0;
+        TypeId type_id = 0;
+        SchemaId schema_id = 0;
+        DataView payload;
+        Timestamp timestamp = 0;
+        transport::Endpoint source;
+    };
+    using SchemaCallback = std::function<void(const IncomingObject&)>;
+
     static constexpr std::size_t kMaxFrame = 65536;
 
     static Timestamp now_ns() noexcept {
@@ -449,10 +481,12 @@ private:
         }
         if (frame.header.message_type == protocol::MessageType::kSchema) {
             handle_schema_response(frame.payload);
+        } else if (frame.header.message_type == protocol::MessageType::kSchemaRequest) {
+            handle_schema_request(frame.payload, source);
         } else if (frame.header.message_type == protocol::MessageType::kData) {
-            handle_data_payload(frame.payload);
+            handle_data_payload(frame.payload, frame.header.schema_id, source);
         } else if (frame.header.message_type == protocol::MessageType::kDelta) {
-            handle_delta(frame.payload);
+            handle_delta(frame.payload, frame.header.schema_id, source);
         } else if (frame.header.message_type == protocol::MessageType::kSnapshotRequest) {
             handle_snapshot_request(frame.payload, source);
         }
@@ -460,11 +494,23 @@ private:
 
     // Applies an incremental delta onto the cached full value, then delivers
     // the patched full value to callbacks.
-    void handle_delta(DataView payload) {
+    void handle_delta(DataView payload, SchemaId schema_id,
+                      const transport::Endpoint& source) {
         if (!delta_enabled_.load(std::memory_order_acquire)) return;
         protocol::DeltaMessage delta;
         if (!decode_delta(payload, delta)) return;
-        const TypeDescriptor* desc = registry().find(delta.type_id);
+
+        const TypeDescriptor* desc = nullptr;
+        if (schema_id != 0) {
+            desc = registry().find_by_fingerprint(schema_id);
+            if (desc == nullptr) {
+                metrics_.rx_schema_miss++;
+                request_schema(schema_id, delta.type_id, 0, source);
+                return;
+            }
+        } else {
+            desc = registry().find(delta.type_id);
+        }
         if (desc == nullptr) return;
 
         std::vector<std::byte> cached;
@@ -481,8 +527,8 @@ private:
             std::lock_guard<std::mutex> lock(cache_mutex_);
             object_cache_[delta.object_id] = cached;
         }
-        dispatch(delta.object_id, delta.type_id, DataView(cached.data(), cached.size()),
-                 delta.timestamp);
+        dispatch(delta.object_id, delta.type_id, schema_id,
+                 DataView(cached.data(), cached.size()), delta.timestamp, source);
     }
 
     // Returns the cached local reflection table, building it from describe<T>()
@@ -500,6 +546,32 @@ private:
         if (it != typed_types_.end()) return it->second;
         typed_types_[type_id] = ref;
         return ref;
+    }
+
+    void subscribe_schema_aware(TypeId type_id, SchemaCallback cb) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        by_type_schema_.emplace_back(type_id, std::move(cb));
+    }
+
+    // Decides whether the local typed reflection can decode this payload.
+    // packed falls back to tag decode when the exact sender schema is absent;
+    // fixed-raw requires the exact schema.
+    bool typed_schema_ok(const ReflectedType& local, const IncomingObject& in) {
+        if (in.schema_id == 0) return true;
+        const TypeDescriptor* sender = registry().find_by_fingerprint(in.schema_id);
+        if (sender != nullptr) {
+            if (schema_decode_compatible(local.descriptor(), *sender)) return true;
+            metrics_.rx_schema_mismatch++;
+            return false;
+        }
+        if (local.descriptor().layout == TypeLayout::kPacked) {
+            metrics_.rx_schema_fallback++;
+            request_schema(in.schema_id, in.type_id, 0, in.source);
+            return true;
+        }
+        metrics_.rx_schema_miss++;
+        request_schema(in.schema_id, in.type_id, 0, in.source);
+        return false;
     }
 
     // Builds a data frame with the requested schema identity, retains the
@@ -573,7 +645,8 @@ private:
 
     // Distinguishes a batch data frame from a single-object data frame and
     // dispatches every contained object to the matching callbacks.
-    void handle_data_payload(DataView payload) {
+    void handle_data_payload(DataView payload, SchemaId schema_id,
+                             const transport::Endpoint& source) {
         if (payload.size() >= 2 &&
             payload.read_at<std::uint16_t>(0) == protocol::kBatchDataMagic) {
             protocol::BatchDataMessage message;
@@ -581,15 +654,16 @@ private:
             metrics_.rx_objects += message.count();
             for (std::size_t i = 0; i < message.count(); ++i) {
                 cache_object(message.object_id(i), message.payload(i));
-                dispatch(message.object_id(i), message.type_id, message.payload(i),
-                         message.timestamp);
+                dispatch(message.object_id(i), message.type_id, schema_id, message.payload(i),
+                         message.timestamp, source);
             }
         } else {
             protocol::DataMessage message;
             if (!decode_data_message(payload, message)) return;
             metrics_.rx_objects++;
             cache_object(message.object_id, message.payload);
-            dispatch(message.object_id, message.type_id, message.payload, message.timestamp);
+            dispatch(message.object_id, message.type_id, schema_id, message.payload,
+                     message.timestamp, source);
         }
     }
 
@@ -665,6 +739,80 @@ private:
         }
     }
 
+    // Asks one peer for an exact schema, rate-limited per schema_id.
+    void request_schema(SchemaId schema_id, TypeId type_id, Version version,
+                        const transport::Endpoint& dest) {
+        if (schema_id == 0 || dest.port() == 0) return;
+
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(schema_request_mutex_);
+            const auto it = schema_request_times_.find(schema_id);
+            if (it != schema_request_times_.end() &&
+                now - it->second < std::chrono::milliseconds(200)) {
+                return;
+            }
+            schema_request_times_[schema_id] = now;
+        }
+
+        protocol::SchemaRequest request;
+        request.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+        request.schema_id = schema_id;
+        request.type_id = type_id;
+        request.version = version;
+
+        std::byte payload_storage[32];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!encode_schema_request(request, writer)) return;
+
+        protocol::Header header;
+        header.message_type = protocol::MessageType::kSchemaRequest;
+        std::byte frame_storage[64];
+        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+        if (!encode_frame(header, payload_storage, writer.offset(), frame_writer)) return;
+        if (send_to_peer(DataView(frame_storage, frame_writer.offset()), dest)) {
+            metrics_.tx_schema_requests++;
+        }
+    }
+
+    void send_schema_response(const TypeDescriptor& descriptor, std::uint32_t request_id,
+                              const transport::Endpoint& dest) {
+        protocol::SchemaResponse response;
+        response.request_id = request_id;
+        response.schema = descriptor;
+        response.schema_name_table_size = 0;
+
+        std::byte payload_storage[kMaxFrame];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!encode_schema_response(response, writer)) return;
+
+        protocol::Header header;
+        header.message_type = protocol::MessageType::kSchema;
+        std::byte frame_storage[kMaxFrame];
+        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+        if (!encode_frame(header, payload_storage, writer.offset(), frame_writer)) return;
+        send_to_peer(DataView(frame_storage, frame_writer.offset()), dest);
+    }
+
+    void handle_schema_request(DataView payload, const transport::Endpoint& source) {
+        ByteReader reader(payload);
+        protocol::SchemaRequest request;
+        if (!decode_schema_request(reader, request)) return;
+
+        const TypeDescriptor* descriptor = nullptr;
+        if (request.schema_id != 0) {
+            descriptor = registry().find_by_fingerprint(request.schema_id);
+        }
+        if (descriptor == nullptr && request.type_id != 0) {
+            descriptor = registry().find(request.type_id, request.version);
+        }
+        if (descriptor == nullptr && request.type_id != 0) {
+            descriptor = registry().find(request.type_id);
+        }
+        if (descriptor == nullptr) return;
+        send_schema_response(*descriptor, request.request_id, source);
+    }
+
     void handle_schema_response(DataView payload) {
         ByteReader reader(payload);
         protocol::SchemaResponse response;
@@ -728,8 +876,10 @@ private:
         }
     }
 
-    void dispatch(ObjectId object_id, TypeId type_id, DataView payload, Timestamp timestamp) {
+    void dispatch(ObjectId object_id, TypeId type_id, SchemaId schema_id, DataView payload,
+                  Timestamp timestamp, const transport::Endpoint& source) {
         std::vector<DataCallback> callbacks;
+        std::vector<SchemaCallback> schema_callbacks;
         {
             std::lock_guard<std::mutex> lock(callback_mutex_);
             for (auto& [oid, cb] : by_object_) {
@@ -738,9 +888,16 @@ private:
             for (auto& [tid, cb] : by_type_) {
                 if (tid == type_id) callbacks.push_back(cb);
             }
+            for (auto& [tid, cb] : by_type_schema_) {
+                if (tid == type_id) schema_callbacks.push_back(cb);
+            }
         }
         for (auto& cb : callbacks) {
             cb(object_id, type_id, payload, timestamp);
+        }
+        IncomingObject incoming{object_id, type_id, schema_id, payload, timestamp, source};
+        for (auto& cb : schema_callbacks) {
+            cb(incoming);
         }
     }
 
@@ -753,6 +910,7 @@ private:
     PeerTable empty_peers_;
     std::mutex callback_mutex_;
     std::vector<std::pair<TypeId, DataCallback>> by_type_;
+    std::vector<std::pair<TypeId, SchemaCallback>> by_type_schema_;
     std::vector<std::pair<ObjectId, DataCallback>> by_object_;
     std::unordered_set<NodeId> known_peers_;
     std::array<std::byte, kMaxFrame> recv_{};
@@ -770,6 +928,9 @@ private:
     std::unordered_map<TypeId, std::vector<RetainedObject>> retained_;
     protocol::FragmentAssembler assembler_;
     std::atomic<std::uint32_t> next_frame_id_{0};
+    std::atomic<std::uint32_t> next_request_id_{0};
+    std::mutex schema_request_mutex_;
+    std::unordered_map<SchemaId, std::chrono::steady_clock::time_point> schema_request_times_;
     static constexpr std::size_t kMaxDatagram = 1400;
     std::atomic<bool> delta_enabled_{false};
     std::mutex cache_mutex_;
