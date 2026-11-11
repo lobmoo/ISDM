@@ -32,4 +32,32 @@ TEST(TypesTest, QualityValuesAreStable) {
     EXPECT_EQ(static_cast<std::uint16_t>(Quality::kBad), 0x0002U);
 }
 
+TEST(TypeMetadataTest, DefaultLayoutIsFixedRaw) {
+    TypeDescriptor desc{};
+    EXPECT_EQ(desc.layout, TypeLayout::kFixedRaw);
+}
+
+TEST(TypeMetadataTest, FieldMetadataDefaults) {
+    FieldDescriptor field{1U, 6U, TypeKind::kFloat32, 0U, 0U, 4U, 0U};
+    EXPECT_EQ(field.element_kind, static_cast<TypeKind>(0));
+    EXPECT_EQ(field_element_kind(field), TypeKind::kFloat32);
+    EXPECT_EQ(field_element_size(field), 4U);
+    EXPECT_FALSE(field_is_variable(field));
+}
+
+TEST(TypeMetadataTest, DetectsVariableFields) {
+    FieldDescriptor string_field{1U, 0U, TypeKind::kString, 0U, 0U, 0U, 0U};
+    EXPECT_TRUE(field_is_variable(string_field));
+
+    FieldDescriptor sequence_field{2U, 0U, TypeKind::kSequence, 0U, 0U, 0U, 0U};
+    EXPECT_TRUE(field_is_variable(sequence_field));
+
+    FieldDescriptor array_field{3U, 0U, TypeKind::kArray, 0U, 0U, 32U, 8U};
+    array_field.element_kind = TypeKind::kFloat32;
+    array_field.element_size = 4U;
+    EXPECT_FALSE(field_is_variable(array_field));
+    EXPECT_EQ(field_element_kind(array_field), TypeKind::kFloat32);
+    EXPECT_EQ(field_element_size(array_field), 4U);
+}
+
 }  // namespace isdm::test

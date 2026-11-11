@@ -139,4 +139,31 @@ TEST(CodecTest, FastPathStructEncodesAndDecodesViaMemcpy) {
     EXPECT_EQ(decoded.z, value.z);
 }
 
+TEST(CodecTest, ReaderSkipAdvancesAndBounds) {
+    std::array<std::byte, 4> data{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    ByteReader reader(DataView(data.data(), data.size()));
+    EXPECT_TRUE(reader.skip(2));
+
+    std::uint8_t value = 0;
+    EXPECT_TRUE(reader.read(value));
+    EXPECT_EQ(value, 3);
+    EXPECT_FALSE(reader.skip(2));  // only 1 byte left
+}
+
+TEST(StructCodecTest, IsFixedLayoutUsesLayoutFlag) {
+    TypeDescriptor packed{};
+    packed.layout = TypeLayout::kPacked;
+    EXPECT_FALSE(StructCodec::is_fixed_layout(packed));
+
+    TypeDescriptor raw{};
+    raw.layout = TypeLayout::kFixedRaw;
+    EXPECT_TRUE(StructCodec::is_fixed_layout(raw));
+
+    FieldDescriptor fields[1]{};
+    fields[0].kind = TypeKind::kString;
+    raw.fields = fields;
+    raw.field_count = 1;
+    EXPECT_FALSE(StructCodec::is_fixed_layout(raw));
+}
+
 }  // namespace isdm::test

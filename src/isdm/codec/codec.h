@@ -97,6 +97,13 @@ public:
         return true;
     }
 
+    // Advances the cursor without copying. Used to skip unknown packed fields.
+    bool skip(std::size_t size) noexcept {
+        if (size > remaining()) return false;
+        offset_ += size;
+        return true;
+    }
+
 private:
     DataView view_;
     std::size_t offset_ = 0;
@@ -105,10 +112,10 @@ private:
 class StructCodec {
 public:
     static bool is_fixed_layout(const TypeDescriptor& desc) noexcept {
+        if (desc.layout == TypeLayout::kPacked) return false;
         for (std::uint32_t i = 0; i < desc.field_count; ++i) {
             const TypeKind kind = desc.fields[i].kind;
-            if (kind == TypeKind::kString || kind == TypeKind::kSequence ||
-                kind == TypeKind::kArray || kind == TypeKind::kStruct) {
+            if (kind == TypeKind::kString || kind == TypeKind::kSequence) {
                 return false;
             }
         }
