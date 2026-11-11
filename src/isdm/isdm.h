@@ -1,6 +1,7 @@
 // ISDM single-entry header. Include this to use the middleware.
 #pragma once
 
+#include "isdm/codec/object_codec.h"
 #include "isdm/core/data_view.h"
 #include "isdm/core/types.h"
 #include "isdm/metrics.h"

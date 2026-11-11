@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "isdm/codec/codec.h"
+#include "isdm/codec/object_codec.h"
 #include "isdm/core/data_view.h"
 #include "isdm/core/types.h"
 #include "isdm/discovery/discovery_manager.h"
@@ -88,11 +90,16 @@ public:
         return true;
     }
 
-    // Convenience: describe<T>() + register in one call.
+    // Convenience: describe<T>() + register in one call, and cache the local
+    // reflection table for typed publish/subscribe.
     template <typename T>
     bool register_type_typed(TypeId type_id, Version version = 1) {
         auto ref = describe<T>(type_id, version);
-        return register_type(ref.descriptor(), ref.name_table_size());
+        if (!register_type(ref.descriptor(), ref.name_table_size())) return false;
+        auto shared = std::make_shared<ReflectedType>(std::move(ref));
+        std::unique_lock<std::shared_mutex> lock(typed_mutex_);
+        typed_types_[type_id] = std::move(shared);
+        return true;
     }
 
     bool start() {
@@ -144,38 +151,55 @@ public:
     }
 
     bool publish(ObjectId object_id, TypeId type_id, DataView data, Timestamp ts = 0) {
-        if (!started_) return false;
-        if (data.size() > 0xFFFFFFFFull) return false;
-
-        protocol::DataMessage message;
-        message.object_id = object_id;
-        message.type_id = type_id;
-        message.timestamp = ts == 0 ? now_ns() : ts;
-        message.payload = data;
-
-        std::byte payload_storage[kMaxFrame];
-        ByteWriter data_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-        if (!encode_data_message(message, data_writer)) return false;
-
-        protocol::Header header;
-        header.message_type = protocol::MessageType::kData;
-        std::byte frame_storage[kMaxFrame];
-        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
-        if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer))
-            return false;
-
-        retain(message.object_id, message.type_id, data.data(), data.size(),
-               message.timestamp);
-        return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
+        return publish_encoded(object_id, type_id, data, ts, 0U);
     }
 
-    // Convenience: publish a trivially-copyable typed value (requires the type
-    // to be registered; e.g. via register_type_typed<T>(type_id)).
+    // Raw publish with an explicit schema identity, for packed payloads and
+    // multi-version deployments. The caller owns payload encoding in this path.
+    bool publish(ObjectId object_id, TypeId type_id, DataView data, Timestamp ts,
+                 SchemaId schema_id) {
+        return publish_encoded(object_id, type_id, data, ts, schema_id);
+    }
+
+    // Convenience: publish a reflected value (fixed raw or packed).
+    // The type must be registered first with register_type_typed<T>().
     template <typename T>
     bool publish_typed(ObjectId object_id, TypeId type_id, const T& value, Timestamp ts = 0) {
-        static_assert(std::is_trivially_copyable<T>::value,
-                      "publish_typed requires a trivially copyable type");
-        return publish(object_id, type_id, DataView(&value, sizeof(T)), ts);
+        std::shared_ptr<ReflectedType> type;
+        {
+            std::shared_lock<std::shared_mutex> lock(typed_mutex_);
+            const auto it = typed_types_.find(type_id);
+            if (it == typed_types_.end()) return false;
+            type = it->second;
+        }
+
+        std::byte payload_storage[kMaxFrame];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!ObjectCodec::encode(*type, &value, writer)) {
+            metrics_.tx_encode_errors++;
+            return false;
+        }
+        return publish_encoded(object_id, type_id,
+                               DataView(payload_storage, writer.offset()), ts,
+                               schema_fingerprint(type->descriptor()));
+    }
+
+    // Dynamic publish: no C++ type is required. Missing fields are encoded as
+    // zero/empty; the descriptor must already be in the registry.
+    bool publish_dynamic(ObjectId object_id, TypeId type_id, const DynamicObject& obj,
+                         Timestamp ts = 0) {
+        const TypeDescriptor* descriptor = registry().find(type_id);
+        if (descriptor == nullptr) return false;
+
+        std::byte payload_storage[kMaxFrame];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!ObjectCodec::encode_dynamic(*descriptor, obj, writer)) {
+            metrics_.tx_encode_errors++;
+            return false;
+        }
+        return publish_encoded(object_id, type_id,
+                               DataView(payload_storage, writer.offset()), ts,
+                               schema_fingerprint(*descriptor));
     }
 
     // Sends only the fields that changed between old and new (same struct). The
@@ -186,6 +210,10 @@ public:
         if (!started_ || old_bytes == nullptr || new_bytes == nullptr) return false;
         const TypeDescriptor* desc = registry().find(type_id);
         if (desc == nullptr || desc->fixed_size != struct_size) return false;
+        if (desc->layout == TypeLayout::kPacked) {
+            metrics_.tx_unsupported_layout++;
+            return false;
+        }
 
         std::byte payload_storage[kMaxFrame];
         ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
@@ -195,6 +223,7 @@ public:
         }
         protocol::Header header;
         header.message_type = protocol::MessageType::kDelta;
+        header.schema_id = schema_fingerprint(*desc);
         std::byte frame_storage[kMaxFrame];
         ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
         if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer))
@@ -209,23 +238,31 @@ public:
                        TypeId type_id, std::size_t payload_size, Timestamp ts = 0) {
         if (!started_ || ids == nullptr || payloads == nullptr || count == 0) return false;
 
+        const TypeDescriptor* descriptor = registry().find(type_id);
+        if (descriptor != nullptr && descriptor->layout == TypeLayout::kPacked) {
+            metrics_.tx_unsupported_layout++;
+            return false;
+        }
+        const Timestamp resolved_ts = ts == 0 ? now_ns() : ts;
+
         std::byte payload_storage[kMaxFrame];
         ByteWriter data_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
         if (!protocol::encode_batch_data(ids, static_cast<const std::byte*>(payloads), count,
-                                         type_id, ts == 0 ? now_ns() : ts, payload_size,
-                                         data_writer)) {
+                                         type_id, resolved_ts, payload_size, data_writer)) {
             return false;
         }
 
         protocol::Header header;
         header.message_type = protocol::MessageType::kData;
+        header.schema_id = descriptor == nullptr ? 0U : schema_fingerprint(*descriptor);
         std::byte frame_storage[kMaxFrame];
         ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
         if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer))
             return false;
         for (std::size_t i = 0; i < count; ++i) {
             retain(ids[i], type_id,
-                   static_cast<const std::byte*>(payloads) + i * payload_size, payload_size, ts);
+                   static_cast<const std::byte*>(payloads) + i * payload_size, payload_size,
+                   resolved_ts);
         }
         metrics_.tx_batches++;
         return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
@@ -422,6 +459,37 @@ private:
         }
         dispatch(delta.object_id, delta.type_id, DataView(cached.data(), cached.size()),
                  delta.timestamp);
+    }
+
+    // Builds a data frame with the requested schema identity, retains the
+    // latest full value, and fans it out to online peers.
+    bool publish_encoded(ObjectId object_id, TypeId type_id, DataView data, Timestamp ts,
+                         SchemaId schema_id) {
+        if (!started_) return false;
+        if (data.size() > 0xFFFFFFFFull) return false;
+
+        protocol::DataMessage message;
+        message.object_id = object_id;
+        message.type_id = type_id;
+        message.timestamp = ts == 0 ? now_ns() : ts;
+        message.payload = data;
+
+        std::byte payload_storage[kMaxFrame];
+        ByteWriter data_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!encode_data_message(message, data_writer)) return false;
+
+        protocol::Header header;
+        header.message_type = protocol::MessageType::kData;
+        header.schema_id = schema_id;
+        std::byte frame_storage[kMaxFrame];
+        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+        if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer)) {
+            return false;
+        }
+
+        retain(message.object_id, message.type_id, data.data(), data.size(),
+               message.timestamp);
+        return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
     }
 
     // Sends a fully-framed message to all online peers; true if any send landed.
@@ -665,6 +733,8 @@ private:
     std::atomic<bool> delta_enabled_{false};
     std::mutex cache_mutex_;
     std::unordered_map<ObjectId, std::vector<std::byte>> object_cache_;
+    std::shared_mutex typed_mutex_;
+    std::unordered_map<TypeId, std::shared_ptr<ReflectedType>> typed_types_;
     bool started_ = false;
 };
 

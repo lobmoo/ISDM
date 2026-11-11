@@ -135,6 +135,11 @@ target_link_libraries(isdm_test_complex_types PRIVATE ISDM::core GTest::gtest_ma
 target_compile_features(isdm_test_complex_types PRIVATE cxx_std_17)
 target_compile_options(isdm_test_complex_types PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(isdm_test_node_complex test_node_complex.cc)
+target_link_libraries(isdm_test_node_complex PRIVATE ISDM::core GTest::gtest_main)
+target_compile_features(isdm_test_node_complex PRIVATE cxx_std_17)
+target_compile_options(isdm_test_node_complex PRIVATE -Wall -Wextra -Wpedantic)
+
 include(GoogleTest)
 gtest_discover_tests(isdm_test_types)
 gtest_discover_tests(isdm_test_spsc_queue)
@@ -163,3 +168,4 @@ gtest_discover_tests(isdm_test_stress)
 gtest_discover_tests(isdm_test_fragment)
 gtest_discover_tests(isdm_test_delta)
 gtest_discover_tests(isdm_test_complex_types)
+gtest_discover_tests(isdm_test_node_complex)
