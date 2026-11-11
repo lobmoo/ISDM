@@ -33,6 +33,7 @@
 #include "isdm/protocol/header.h"
 #include "isdm/protocol/schema_sync.h"
 #include "isdm/protocol/snapshot.h"
+#include "isdm/runtime/object_state_store.h"
 #include "isdm/schema/schema_registry.h"
 #include "isdm/transport/transport.h"
 #include "isdm/transport/udp_transport.h"
@@ -54,6 +55,13 @@ struct NodeConfig {
     std::chrono::milliseconds hello_interval{1000};
     std::chrono::milliseconds peer_timeout{3000};
     bool peer_offline_enabled = false;  // enable offline detection + callbacks
+
+    // Bounded full-object state store used for snapshot/dedup/delta baselines.
+    std::size_t max_state_objects = 1000000U;
+    std::size_t max_state_bytes = 512ULL * 1024ULL * 1024ULL;
+    std::size_t snapshot_sender_copy_bytes = 64ULL * 1024ULL * 1024ULL;
+    std::size_t snapshot_staging_limit_bytes = 64ULL * 1024ULL * 1024ULL;
+    std::chrono::milliseconds snapshot_timeout{5000};
 };
 
 // Application-facing node: composes discovery, schema registry, and the
@@ -64,7 +72,9 @@ public:
     // Receives a published object's struct bytes (zero-copy into the frame).
     using DataCallback = std::function<void(ObjectId, TypeId, DataView, Timestamp)>;
 
-    explicit Node(NodeConfig config) : config_(std::move(config)) {}
+    explicit Node(NodeConfig config) : config_(std::move(config)) {
+        state_store_.set_limits(config_.max_state_objects, config_.max_state_bytes);
+    }
     ~Node() { stop(); }
 
     Node(const Node&) = delete;
@@ -212,27 +222,78 @@ public:
     // regular publish() still sends full objects.
     bool publish_delta(ObjectId object_id, TypeId type_id, const void* old_bytes,
                        const void* new_bytes, std::size_t struct_size, Timestamp ts = 0) {
-        if (!started_ || old_bytes == nullptr || new_bytes == nullptr) return false;
+        (void)old_bytes;  // the authoritative baseline is the state store
+        if (!started_ || new_bytes == nullptr) return false;
         const TypeDescriptor* desc = registry().find(type_id);
         if (desc == nullptr || desc->fixed_size != struct_size) return false;
         if (desc->layout == TypeLayout::kPacked) {
             metrics_.tx_unsupported_layout++;
             return false;
         }
+        const SchemaId schema_id = schema_fingerprint(*desc);
+        const Timestamp resolved_ts = ts == 0 ? now_ns() : ts;
+
+        ObjectState base;
+        if (!state_store_.get(type_id, object_id, base) ||
+            base.payload.size() != struct_size) {
+            metrics_.tx_delta_fallback++;
+            return publish_encoded(object_id, type_id, DataView(new_bytes, struct_size),
+                                   resolved_ts, schema_id);
+        }
 
         std::byte payload_storage[kMaxFrame];
         ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-        if (!protocol::encode_delta(*desc, object_id, type_id, ts == 0 ? now_ns() : ts,
-                                    old_bytes, new_bytes, writer)) {
+        if (!protocol::encode_delta(*desc, object_id, type_id, resolved_ts,
+                                    base.payload.data(), new_bytes, writer)) {
             return false;
         }
         protocol::Header header;
         header.message_type = protocol::MessageType::kDelta;
-        header.schema_id = schema_fingerprint(*desc);
+        header.schema_id = schema_id;
         std::byte frame_storage[kMaxFrame];
         ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
         if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer))
             return false;
+        retain(object_id, type_id, schema_id, new_bytes, struct_size, resolved_ts);
+        metrics_.tx_batches++;
+        return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
+    }
+
+    // Typed delta: the baseline is the state store's latest full value. If no
+    // baseline exists, falls back to a full publish.
+    template <typename T>
+    bool publish_delta_typed(ObjectId object_id, TypeId type_id, const T& new_value,
+                             Timestamp ts = 0) {
+        auto type = find_typed_type(type_id);
+        if (type == nullptr) return false;
+        const TypeDescriptor& desc = type->descriptor();
+        if (desc.layout == TypeLayout::kPacked) {
+            metrics_.tx_unsupported_layout++;
+            return false;
+        }
+
+        ObjectState base;
+        if (!state_store_.get(type_id, object_id, base) || base.payload.size() != sizeof(T)) {
+            metrics_.tx_delta_fallback++;
+            return publish_typed(object_id, type_id, new_value, ts);
+        }
+
+        const SchemaId schema_id = schema_fingerprint(desc);
+        const Timestamp resolved_ts = ts == 0 ? now_ns() : ts;
+        std::byte payload_storage[kMaxFrame];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!protocol::encode_delta(desc, object_id, type_id, resolved_ts,
+                                    base.payload.data(), &new_value, writer)) {
+            return false;
+        }
+        protocol::Header header;
+        header.message_type = protocol::MessageType::kDelta;
+        header.schema_id = schema_id;
+        std::byte frame_storage[kMaxFrame];
+        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+        if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer))
+            return false;
+        retain(object_id, type_id, schema_id, &new_value, sizeof(T), resolved_ts);
         metrics_.tx_batches++;
         return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
     }
@@ -259,13 +320,15 @@ public:
 
         protocol::Header header;
         header.message_type = protocol::MessageType::kData;
-        header.schema_id = descriptor == nullptr ? 0U : schema_fingerprint(*descriptor);
+        const SchemaId schema_id =
+            descriptor == nullptr ? 0U : schema_fingerprint(*descriptor);
+        header.schema_id = schema_id;
         std::byte frame_storage[kMaxFrame];
         ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
         if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer))
             return false;
         for (std::size_t i = 0; i < count; ++i) {
-            retain(ids[i], type_id,
+            retain(ids[i], type_id, schema_id,
                    static_cast<const std::byte*>(payloads) + i * payload_size, payload_size,
                    resolved_ts);
         }
@@ -513,22 +576,22 @@ private:
         }
         if (desc == nullptr) return;
 
-        std::vector<std::byte> cached;
-        {
-            std::lock_guard<std::mutex> lock(cache_mutex_);
-            auto it = object_cache_.find(delta.object_id);
-            if (it == object_cache_.end()) return;  // no base to patch yet
-            cached = it->second;
+        ObjectState base;
+        if (!state_store_.get(delta.type_id, delta.object_id, base)) {
+            metrics_.rx_delta_no_base++;
+            return;
         }
-        if (cached.size() != desc->fixed_size) return;
-        if (!protocol::apply_delta(*desc, cached.data(), delta)) return;
+        if (base.payload.size() != desc->fixed_size) return;
+        if (!protocol::apply_delta(*desc, base.payload.data(), delta)) return;
 
-        {
-            std::lock_guard<std::mutex> lock(cache_mutex_);
-            object_cache_[delta.object_id] = cached;
+        base.schema_id = schema_id != 0 ? schema_id : base.schema_id;
+        base.timestamp = delta.timestamp;
+        if (!state_store_.upsert(base, true)) {
+            metrics_.rx_stale++;
+            return;
         }
-        dispatch(delta.object_id, delta.type_id, schema_id,
-                 DataView(cached.data(), cached.size()), delta.timestamp, source);
+        dispatch(delta.object_id, delta.type_id, base.schema_id,
+                 DataView(base.payload.data(), base.payload.size()), delta.timestamp, source);
     }
 
     // Returns the cached local reflection table, building it from describe<T>()
@@ -546,6 +609,12 @@ private:
         if (it != typed_types_.end()) return it->second;
         typed_types_[type_id] = ref;
         return ref;
+    }
+
+    std::shared_ptr<ReflectedType> find_typed_type(TypeId type_id) {
+        std::shared_lock<std::shared_mutex> lock(typed_mutex_);
+        const auto it = typed_types_.find(type_id);
+        return it == typed_types_.end() ? nullptr : it->second;
     }
 
     void subscribe_schema_aware(TypeId type_id, SchemaCallback cb) {
@@ -600,7 +669,7 @@ private:
             return false;
         }
 
-        retain(message.object_id, message.type_id, data.data(), data.size(),
+        retain(message.object_id, message.type_id, schema_id, data.data(), data.size(),
                message.timestamp);
         return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
     }
@@ -653,7 +722,13 @@ private:
             if (!decode_batch_data(payload, message)) return;
             metrics_.rx_objects += message.count();
             for (std::size_t i = 0; i < message.count(); ++i) {
-                cache_object(message.object_id(i), message.payload(i));
+                const bool accepted =
+                    cache_object(message.object_id(i), message.type_id, schema_id,
+                                 message.timestamp, message.payload(i));
+                if (!accepted) {
+                    metrics_.rx_stale++;
+                    continue;
+                }
                 dispatch(message.object_id(i), message.type_id, schema_id, message.payload(i),
                          message.timestamp, source);
             }
@@ -661,18 +736,30 @@ private:
             protocol::DataMessage message;
             if (!decode_data_message(payload, message)) return;
             metrics_.rx_objects++;
-            cache_object(message.object_id, message.payload);
+            const bool accepted = cache_object(message.object_id, message.type_id, schema_id,
+                                               message.timestamp, message.payload);
+            if (!accepted) {
+                metrics_.rx_stale++;
+                return;
+            }
             dispatch(message.object_id, message.type_id, schema_id, message.payload,
                      message.timestamp, source);
         }
     }
 
-    // Seeds the delta cache with a full object value when delta is enabled.
-    void cache_object(ObjectId object_id, DataView value) {
-        if (!delta_enabled_.load(std::memory_order_acquire)) return;
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-        object_cache_[object_id] =
-            std::vector<std::byte>(value.data(), value.data() + value.size());
+    // Stores a received full object; returns false when an older value is
+    // already present (dedup).
+    bool cache_object(ObjectId object_id, TypeId type_id, SchemaId schema_id,
+                      Timestamp timestamp, DataView value) {
+        ObjectState state;
+        state.type_id = type_id;
+        state.object_id = object_id;
+        state.schema_id = schema_id;
+        state.timestamp = timestamp;
+        if (value.size() != 0) {
+            state.payload.assign(value.data(), value.data() + value.size());
+        }
+        return state_store_.upsert(std::move(state), true);
     }
 
     // One full control + data iteration, used by pump() (single-threaded mode).
@@ -822,22 +909,20 @@ private:
         }
     }
 
-    // Remembers the latest payload for an object so a (re)connecting peer can
-    // recover its full state via a snapshot request.
-    void retain(ObjectId object_id, TypeId type_id, const void* data, std::size_t size,
-                Timestamp timestamp) {
-        std::vector<std::byte> copy(static_cast<const std::byte*>(data),
-                                    static_cast<const std::byte*>(data) + size);
-        std::lock_guard<std::mutex> lock(retained_mutex_);
-        auto& objects = retained_[type_id];
-        for (auto& entry : objects) {
-            if (entry.object_id == object_id) {
-                entry.payload = std::move(copy);
-                entry.timestamp = timestamp;
-                return;
-            }
+    // Remembers the latest full payload for an object so a (re)connecting peer
+    // can recover its full state via a snapshot request.
+    void retain(ObjectId object_id, TypeId type_id, SchemaId schema_id, const void* data,
+                std::size_t size, Timestamp timestamp) {
+        ObjectState state;
+        state.type_id = type_id;
+        state.object_id = object_id;
+        state.schema_id = schema_id;
+        state.timestamp = timestamp;
+        if (size != 0) {
+            state.payload.assign(static_cast<const std::byte*>(data),
+                                 static_cast<const std::byte*>(data) + size);
         }
-        objects.push_back(RetainedObject{object_id, std::move(copy), timestamp});
+        state_store_.upsert(std::move(state), false);
     }
 
     void handle_snapshot_request(DataView payload, const transport::Endpoint& source) {
@@ -848,15 +933,11 @@ private:
     }
 
     // Replies to a snapshot request by sending each retained object of the type
-    // as a single data frame to the requester.
+    // as a single data frame to the requester. M3 replaces this with an atomic
+    // Begin/Chunk/End stream.
     void reply_snapshot(TypeId type_id, const transport::Endpoint& dest) {
-        std::vector<RetainedObject> objects;
-        {
-            std::lock_guard<std::mutex> lock(retained_mutex_);
-            const auto it = retained_.find(type_id);
-            if (it != retained_.end()) objects = it->second;
-        }
-        for (const auto& object : objects) {
+        const std::vector<ObjectState> objects = state_store_.snapshot(type_id);
+        for (const ObjectState& object : objects) {
             protocol::DataMessage message;
             message.object_id = object.object_id;
             message.type_id = type_id;
@@ -869,6 +950,7 @@ private:
 
             protocol::Header header;
             header.message_type = protocol::MessageType::kData;
+            header.schema_id = object.schema_id;
             std::byte frame_storage[kMaxFrame];
             ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
             if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer)) continue;
@@ -919,13 +1001,7 @@ private:
     std::thread data_thread_;
     std::atomic<bool> running_{false};
     Metrics metrics_;
-    struct RetainedObject {
-        ObjectId object_id;
-        std::vector<std::byte> payload;
-        Timestamp timestamp;
-    };
-    std::mutex retained_mutex_;
-    std::unordered_map<TypeId, std::vector<RetainedObject>> retained_;
+    ObjectStateStore state_store_;
     protocol::FragmentAssembler assembler_;
     std::atomic<std::uint32_t> next_frame_id_{0};
     std::atomic<std::uint32_t> next_request_id_{0};
@@ -933,8 +1009,6 @@ private:
     std::unordered_map<SchemaId, std::chrono::steady_clock::time_point> schema_request_times_;
     static constexpr std::size_t kMaxDatagram = 1400;
     std::atomic<bool> delta_enabled_{false};
-    std::mutex cache_mutex_;
-    std::unordered_map<ObjectId, std::vector<std::byte>> object_cache_;
     std::shared_mutex typed_mutex_;
     std::unordered_map<TypeId, std::shared_ptr<ReflectedType>> typed_types_;
     bool started_ = false;

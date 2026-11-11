@@ -16,10 +16,13 @@ public:
     std::atomic<std::uint64_t> tx_encode_errors{0};
     std::atomic<std::uint64_t> tx_unsupported_layout{0};
     std::atomic<std::uint64_t> tx_schema_requests{0};
+    std::atomic<std::uint64_t> tx_delta_fallback{0};
     std::atomic<std::uint64_t> rx_frames{0};
     std::atomic<std::uint64_t> rx_bytes{0};
     std::atomic<std::uint64_t> rx_dropped{0};
     std::atomic<std::uint64_t> rx_objects{0};
+    std::atomic<std::uint64_t> rx_stale{0};
+    std::atomic<std::uint64_t> rx_delta_no_base{0};
     std::atomic<std::uint64_t> rx_schema_updates{0};
     std::atomic<std::uint64_t> rx_schema_miss{0};
     std::atomic<std::uint64_t> rx_schema_fallback{0};
@@ -33,10 +36,13 @@ public:
         std::uint64_t tx_encode_errors;
         std::uint64_t tx_unsupported_layout;
         std::uint64_t tx_schema_requests;
+        std::uint64_t tx_delta_fallback;
         std::uint64_t rx_frames;
         std::uint64_t rx_bytes;
         std::uint64_t rx_dropped;
         std::uint64_t rx_objects;
+        std::uint64_t rx_stale;
+        std::uint64_t rx_delta_no_base;
         std::uint64_t rx_schema_updates;
         std::uint64_t rx_schema_miss;
         std::uint64_t rx_schema_fallback;
@@ -51,10 +57,13 @@ public:
                         tx_encode_errors.load(std::memory_order_relaxed),
                         tx_unsupported_layout.load(std::memory_order_relaxed),
                         tx_schema_requests.load(std::memory_order_relaxed),
+                        tx_delta_fallback.load(std::memory_order_relaxed),
                         rx_frames.load(std::memory_order_relaxed),
                         rx_bytes.load(std::memory_order_relaxed),
                         rx_dropped.load(std::memory_order_relaxed),
                         rx_objects.load(std::memory_order_relaxed),
+                        rx_stale.load(std::memory_order_relaxed),
+                        rx_delta_no_base.load(std::memory_order_relaxed),
                         rx_schema_updates.load(std::memory_order_relaxed),
                         rx_schema_miss.load(std::memory_order_relaxed),
                         rx_schema_fallback.load(std::memory_order_relaxed),
@@ -69,10 +78,13 @@ public:
         tx_encode_errors = 0;
         tx_unsupported_layout = 0;
         tx_schema_requests = 0;
+        tx_delta_fallback = 0;
         rx_frames = 0;
         rx_bytes = 0;
         rx_dropped = 0;
         rx_objects = 0;
+        rx_stale = 0;
+        rx_delta_no_base = 0;
         rx_schema_updates = 0;
         rx_schema_miss = 0;
         rx_schema_fallback = 0;
