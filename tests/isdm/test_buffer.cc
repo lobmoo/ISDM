@@ -1,3 +1,5 @@
+#include <utility>
+
 #include <gtest/gtest.h>
 
 #include "isdm/core/buffer.h"
@@ -54,6 +56,29 @@ TEST(BufferPoolTest, ReturnsEmptyBufferWhenPoolIsExhausted) {
     auto first = pool.acquire(100);
     ASSERT_TRUE(first);
     EXPECT_FALSE(pool.acquire(100));
+}
+
+TEST(BufferPoolTest, MoveAssignmentReleasesPreviousBlock) {
+    BufferPool::Config config;
+    config.small_count = 2;
+    config.medium_count = 0;
+    config.large_count = 0;
+    config.huge_count = 0;
+    BufferPool pool(config);
+
+    auto a = pool.acquire(100);
+    auto b = pool.acquire(100);
+    ASSERT_TRUE(a);
+    ASSERT_TRUE(b);
+
+    // b's previous block must be returned to the pool, otherwise the next
+    // acquire would fail even though only one buffer is still alive.
+    b = std::move(a);
+    EXPECT_FALSE(a);
+
+    auto c = pool.acquire(100);
+    ASSERT_TRUE(c);  // b's old block was released by move assignment
+    EXPECT_FALSE(pool.acquire(100));  // b and c still hold the two blocks
 }
 
 TEST(BufferPoolTest, RejectsRequestsLargerThanLargestClass) {
