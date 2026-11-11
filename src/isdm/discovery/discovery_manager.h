@@ -38,24 +38,10 @@ public:
 
     // Sends this node's HELLO to the advertise endpoint. Returns false if the
     // transport is closed or the datagram could not be sent.
-    bool advertise() {
-        if (transport_ == nullptr || !transport_->is_open()) return false;
-        protocol::DiscoveryMessage message;
-        message.type = protocol::DiscoveryType::kHello;
-        message.node_id = config_.node_id;
-        message.node_name = config_.node_name;
-        message.capabilities = config_.capabilities;
-        message.data_endpoint =
-            config_.advertised_data_endpoint.port() == 0
-                ? transport_->local_endpoint()
-                : config_.advertised_data_endpoint;
-        message.schema_fingerprints = config_.schema_fingerprints;
+    bool advertise() { return send(protocol::DiscoveryType::kHello); }
 
-        ByteWriter writer(MutableDataView(send_buffer_.data(), send_buffer_.size()));
-        if (!encode_discovery(message, writer)) return false;
-        return transport_->send_to(DataView(send_buffer_.data(), writer.offset()),
-                                   config_.advertise_endpoint) != 0;
-    }
+    // Sends GOODBYE so peers can mark this node offline immediately.
+    bool goodbye() { return send(protocol::DiscoveryType::kGoodbye); }
 
     // Non-blocking: receives up to one datagram and dispatches it. Returns
     // true if a datagram was received and handled.
@@ -75,8 +61,13 @@ public:
         protocol::DiscoveryMessage message;
         ByteReader reader(data);
         if (!decode_discovery(reader, message)) return PeerEvent::kInvalid;
-        if (message.type != protocol::DiscoveryType::kHello) return PeerEvent::kInvalid;
         if (message.node_id == config_.node_id) return PeerEvent::kInvalid;
+
+        if (message.type == protocol::DiscoveryType::kGoodbye) {
+            peers_.remove(message.node_id);
+            return PeerEvent::kInvalid;
+        }
+        if (message.type != protocol::DiscoveryType::kHello) return PeerEvent::kInvalid;
 
         PeerInfo peer;
         peer.node_id = message.node_id;
@@ -93,6 +84,25 @@ public:
     const PeerTable& peers() const { return peers_; }
 
 private:
+    bool send(protocol::DiscoveryType type) {
+        if (transport_ == nullptr || !transport_->is_open()) return false;
+        protocol::DiscoveryMessage message;
+        message.type = type;
+        message.node_id = config_.node_id;
+        message.node_name = config_.node_name;
+        message.capabilities = config_.capabilities;
+        message.data_endpoint =
+            config_.advertised_data_endpoint.port() == 0
+                ? transport_->local_endpoint()
+                : config_.advertised_data_endpoint;
+        message.schema_fingerprints = config_.schema_fingerprints;
+
+        ByteWriter writer(MutableDataView(send_buffer_.data(), send_buffer_.size()));
+        if (!encode_discovery(message, writer)) return false;
+        return transport_->send_to(DataView(send_buffer_.data(), writer.offset()),
+                                   config_.advertise_endpoint) != 0;
+    }
+
     transport::ITransport* transport_;
     Config config_;
     std::array<std::byte, 4096> send_buffer_{};

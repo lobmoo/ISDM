@@ -19,8 +19,12 @@ int main() {
     }
     std::printf("[publisher] started, advertising Motor v1\n");
 
-    // Allow discovery + schema sync to settle.
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    // Wait for a peer instead of a fixed sleep: HELLO scheduling is periodic,
+    // so a hard-coded settle time races with the subscriber's first HELLO.
+    for (int i = 0; i < 400 && publisher.peers().size() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // schema push
 
     for (int i = 1; i <= 10; ++i) {
         app::Motor motor{static_cast<std::uint32_t>(i), 1000.0f + i * 10.0f, 20.0f + i};

@@ -1,5 +1,5 @@
 // ISDM performance benchmark (informational; no assertions).
-// Measures: struct codec, batch codec, SPSC queue, and end-to-end
+// Measures: struct codec, batch codec, and end-to-end
 // publish -> subscribe throughput + latency.
 
 #include <atomic>
@@ -11,7 +11,6 @@
 
 #include "isdm/isdm.h"
 #include "isdm/reflect.h"
-#include "isdm/runtime/spsc_queue.h"
 
 namespace bench {
 
@@ -69,22 +68,6 @@ void bench_codec() {
     const auto e1 = Clock::now();
     std::printf("codec  encode   %8.1f M ops/s\n",
                 kIters / std::chrono::duration<double>(e1 - e0).count() / 1e6);
-}
-
-void bench_queue() {
-    isdm::SpscQueue<std::uint64_t> q(4096);
-    const std::size_t kIters = 5000000;
-    const auto t0 = Clock::now();
-    for (std::size_t i = 0; i < kIters; ++i) {
-        q.try_enqueue(i);
-    }
-    // drain
-    std::uint64_t sink = 0;
-    while (q.try_dequeue(sink)) {
-    }
-    const auto t1 = Clock::now();
-    std::printf("queue  spsc     %8.1f M ops/s (enqueue+dequeue)\n",
-                2.0 * kIters / std::chrono::duration<double>(t1 - t0).count() / 1e6);
 }
 
 void bench_end_to_end() {
@@ -172,7 +155,6 @@ void bench_delta_bytes() {
 int main() {
     std::printf("== ISDM benchmark ==\n");
     bench_codec();
-    bench_queue();
     bench_delta_bytes();
     bench_end_to_end();
     return 0;

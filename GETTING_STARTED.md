@@ -7,18 +7,14 @@
 - C++17 编译器（GCC 9+ / Clang 10+）
 - CMake 3.16+
 - Linux（本项目基于 POSIX socket / 组播）
+- 单元测试：GoogleTest（Ubuntu 可安装 `libgtest-dev`）
 
-## 2. 克隆与获取第三方依赖
+## 2. 克隆仓库
 
 ```bash
 git clone <your-repo>.git ISDM
 cd ISDM
-
-# 拉取 readerwriterqueue 子模块（项目使用的唯一第三方 header-only 队列）
-git submodule update --init --recursive
 ```
-
-`thirdparty/` 里的子模块内容不纳入仓库源码，由 submodule 按上游固定 commit 拉取。
 
 ## 3. 编译
 
@@ -274,6 +270,24 @@ sub.request_snapshot(310);
 ./build/tests/isdm/isdm_test_object_state_store
 ```
 
+### 6.4 可靠性（M4）
+
+- 帧头 `sequence` 递增，接收端统计 `rx_gaps` / `rx_duplicates`。
+- 缺失 schema/快照请求自动重试（最多 3 次）；`request_id` 匹配响应。
+- `node.stop()` 会发送 `GOODBYE`，对端立即移除 peer 并触发离线回调。
+- 状态存储、快照 staging、分片 pending 都有上限；不会无界增长。
+
+```cpp
+const auto metrics = node.metrics().snapshot();
+// metrics.rx_gaps / metrics.retry_count / metrics.snapshot_received ...
+```
+
+运行测试：
+
+```bash
+./build/tests/isdm/isdm_test_reliability
+```
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。
@@ -288,6 +302,4 @@ src/isdm/         中间件全部源码（头文件与 .cc 同目录）
 tests/isdm/       单元 + 集成测试
 examples/         端到端 Demo
 doc/              设计文档
-thirdparty/       readerwriterqueue（git submodule，BSD-2-Clause）
-THIRD_PARTY_NOTICES.md
 ```

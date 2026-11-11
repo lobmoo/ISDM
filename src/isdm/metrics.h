@@ -39,6 +39,10 @@ public:
     std::atomic<std::uint64_t> snapshot_incomplete{0};
     std::atomic<std::uint64_t> snapshot_overflow{0};
     std::atomic<std::uint64_t> snapshot_sender_overflow{0};
+    std::atomic<std::uint64_t> rx_gaps{0};
+    std::atomic<std::uint64_t> rx_duplicates{0};
+    std::atomic<std::uint64_t> tx_snapshot_requests{0};
+    std::atomic<std::uint64_t> retry_count{0};
 
     struct Snapshot {
         std::uint64_t tx_frames;
@@ -70,6 +74,10 @@ public:
         std::uint64_t snapshot_incomplete;
         std::uint64_t snapshot_overflow;
         std::uint64_t snapshot_sender_overflow;
+        std::uint64_t rx_gaps;
+        std::uint64_t rx_duplicates;
+        std::uint64_t tx_snapshot_requests;
+        std::uint64_t retry_count;
     };
 
     Snapshot snapshot() const noexcept {
@@ -101,7 +109,11 @@ public:
                         snapshot_discarded.load(std::memory_order_relaxed),
                         snapshot_incomplete.load(std::memory_order_relaxed),
                         snapshot_overflow.load(std::memory_order_relaxed),
-                        snapshot_sender_overflow.load(std::memory_order_relaxed)};
+                        snapshot_sender_overflow.load(std::memory_order_relaxed),
+                        rx_gaps.load(std::memory_order_relaxed),
+                        rx_duplicates.load(std::memory_order_relaxed),
+                        tx_snapshot_requests.load(std::memory_order_relaxed),
+                        retry_count.load(std::memory_order_relaxed)};
     }
 
     void reset() noexcept {
@@ -134,6 +146,10 @@ public:
         snapshot_incomplete = 0;
         snapshot_overflow = 0;
         snapshot_sender_overflow = 0;
+        rx_gaps = 0;
+        rx_duplicates = 0;
+        tx_snapshot_requests = 0;
+        retry_count = 0;
     }
 };
 

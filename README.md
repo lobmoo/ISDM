@@ -24,6 +24,7 @@
 - C++17 编译器 (GCC 9+ / Clang 10+)
 - CMake 3.15+
 - Linux Kernel 5.x+ (推荐)
+- 单元测试需要 GoogleTest（Ubuntu 可安装 `libgtest-dev`）
 
 ### 编译
 
@@ -31,9 +32,6 @@
 # 克隆仓库
 git clone <your-repo>.git ISDM
 cd ISDM
-
-# 获取 readerwriterqueue 子模块
-git submodule update --init --recursive
 
 # 编译、测试
 cmake -S . -B build \
@@ -180,6 +178,14 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 - Delta baseline 来自 store 的最新 full 值；`publish_delta_typed<T>` 在无 baseline 时自动回退 full publish。
 - 覆盖测试：`isdm_test_snapshot_atomicity`、`isdm_test_object_state_store`、`isdm_test_fragment`。
 
+### 可靠性（M4）
+
+- 每个 data/delta 帧携带递增 `sequence`；接收端按来源统计 `rx_gaps` / `rx_duplicates`。
+- 缺失 schema 或快照请求自动重试：200ms/500ms，最多 3 次；响应/`SnapshotBegin` 按 `request_id` 清除 pending。
+- `Node::stop()` 发送 `GOODBYE`；对端立即移除 peer 并触发离线回调，不等 3s 超时。
+- 有界状态：ObjectStateStore、snapshot staging、fragment pending、schema request 表都有上限/清理。
+- 覆盖测试：`isdm_test_reliability`。
+
 ## 架构概览
 
 ```
@@ -237,7 +243,7 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 - [x] **Phase 1**: 基础框架 (完成)
 - [x] **Phase 2**: 协议层基础 (完成)
 - [x] **Phase 3**: UDP传输 + Discovery (完成)
-- [ ] **Phase 4**: Batch + Delta (进行中；字段级 Delta、分片、M1 复杂类型、M2 Schema 演进、M3 快照一致性已完成，对象级 Delta/600K 验证待做)
+- [ ] **Phase 4**: Batch + Delta (进行中；字段级 Delta、分片、M1 复杂类型、M2 Schema 演进、M3 快照一致性、M4 可靠性已完成，对象级 Delta/600K 验证待做)
 - [ ] **Phase 5**: Shared Memory
 - [ ] **Phase 6**: 大规模验证 (600K)
 - [ ] **Phase 7**: 高级特性 (Schema Evolution, Security)

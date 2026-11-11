@@ -161,6 +161,7 @@ public:
         started_ = false;
         if (control_thread_.joinable()) control_thread_.join();
         if (data_thread_.joinable()) data_thread_.join();
+        if (discovery_ != nullptr) discovery_->goodbye();
         discovery_.reset();
         data_.reset();
         control_.reset();
@@ -250,6 +251,7 @@ public:
         }
         protocol::Header header;
         header.message_type = protocol::MessageType::kDelta;
+        header.sequence = next_sequence();
         header.schema_id = schema_id;
         std::byte frame_storage[kMaxFrame];
         ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
@@ -289,6 +291,7 @@ public:
         }
         protocol::Header header;
         header.message_type = protocol::MessageType::kDelta;
+        header.sequence = next_sequence();
         header.schema_id = schema_id;
         std::byte frame_storage[kMaxFrame];
         ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
@@ -321,6 +324,7 @@ public:
 
         protocol::Header header;
         header.message_type = protocol::MessageType::kData;
+        header.sequence = next_sequence();
         const SchemaId schema_id =
             descriptor == nullptr ? 0U : schema_fingerprint(*descriptor);
         header.schema_id = schema_id;
@@ -421,21 +425,35 @@ public:
 
     // Asks all online peers to send their full retained state for a type.
     bool request_snapshot(TypeId type_id) {
-        if (!started_) return false;
-        std::byte payload_storage[32];
-        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!started_ || discovery_ == nullptr) return false;
         protocol::SnapshotRequest request;
         request.type_id = type_id;
         request.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
-        if (!protocol::encode_snapshot_request(request, writer)) return false;
 
-        protocol::Header header;
-        header.message_type = protocol::MessageType::kSnapshotRequest;
-        std::byte frame_storage[kMaxFrame];
-        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
-        if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer))
-            return false;
-        return send_frame_to_known_peers(DataView(frame_storage, frame_writer.offset()));
+        std::vector<transport::Endpoint> peers;
+        discovery_->peers().for_each([&](const PeerInfo& peer) {
+            if (peer.online) peers.push_back(peer.endpoint);
+        });
+        if (peers.empty()) return false;
+
+        bool sent = false;
+        for (const transport::Endpoint& peer : peers) {
+            if (send_snapshot_request_frame(request, peer)) sent = true;
+        }
+        if (!sent) return false;
+        metrics_.tx_snapshot_requests++;
+
+        PendingRequest pending;
+        pending.type = PendingRequestType::kSnapshot;
+        pending.request_id = request.request_id;
+        pending.type_id = type_id;
+        pending.peers = std::move(peers);
+        pending.next_retry =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        pending.attempts = 1;
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_requests_[request.request_id] = std::move(pending);
+        return true;
     }
 
     // Drive discovery and data synchronously when config.threaded == false.
@@ -496,12 +514,45 @@ private:
         }
     };
 
+    enum class PendingRequestType : std::uint8_t { kSchema = 1, kSnapshot = 2 };
+    struct PendingRequest {
+        PendingRequestType type = PendingRequestType::kSchema;
+        std::uint32_t request_id = 0;
+        TypeId type_id = 0;
+        SchemaId schema_id = 0;
+        Version version = 0;
+        std::vector<transport::Endpoint> peers;
+        std::chrono::steady_clock::time_point next_retry;
+        int attempts = 0;
+    };
+
     static constexpr std::size_t kMaxFrame = 65536;
 
     static Timestamp now_ns() noexcept {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
                    std::chrono::system_clock::now().time_since_epoch())
             .count();
+    }
+
+    std::uint64_t next_sequence() noexcept {
+        return tx_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    // Tracks per-source frame sequences and counts gaps/duplicates. Frame-level
+    // sequencing is independent of object-level dedup in ObjectStateStore.
+    void note_sequence(const transport::Endpoint& source, std::uint64_t sequence) {
+        std::lock_guard<std::mutex> lock(sequence_mutex_);
+        const auto it = rx_sequences_.find(source);
+        if (it == rx_sequences_.end()) {
+            rx_sequences_.emplace(source, sequence);
+            return;
+        }
+        if (sequence > it->second + 1) {
+            metrics_.rx_gaps += sequence - it->second - 1;
+        } else if (sequence <= it->second) {
+            metrics_.rx_duplicates++;
+        }
+        if (sequence > it->second) it->second = sequence;
     }
 
     // Sends this node's registered schemas to any newly-discovered online peer.
@@ -513,14 +564,28 @@ private:
             std::lock_guard<std::mutex> lock(callback_mutex_);
             cb = peer_state_callback_;
         }
+        std::unordered_set<NodeId> present;
         discovery_->peers().for_each([&](const PeerInfo& peer) {
-            if (!peer.online) return;
+            present.insert(peer.node_id);
+            if (!peer.online) {
+                known_peers_.erase(peer.node_id);
+                return;
+            }
             const bool is_new = known_peers_.insert(peer.node_id).second;
             if (is_new) {
                 targets.push_back(peer.endpoint);
                 if (cb) cb(peer.node_id, true);  // peer came online
             }
         });
+        for (auto it = known_peers_.begin(); it != known_peers_.end();) {
+            if (present.find(*it) == present.end()) {
+                const NodeId offline = *it;
+                it = known_peers_.erase(it);
+                if (cb) cb(offline, false);  // GOODBYE removed the peer
+            } else {
+                ++it;
+            }
+        }
         for (const auto& endpoint : targets) {
             push_schemas_to(endpoint);
         }
@@ -574,6 +639,11 @@ private:
         if (!parse_frame(frame_bytes, frame)) {
             metrics_.rx_dropped++;
             return;
+        }
+        if (frame.header.sequence != 0 &&
+            (frame.header.message_type == protocol::MessageType::kData ||
+             frame.header.message_type == protocol::MessageType::kDelta)) {
+            note_sequence(source, frame.header.sequence);
         }
         if (frame.header.message_type == protocol::MessageType::kSchema) {
             handle_schema_response(frame.payload);
@@ -698,6 +768,7 @@ private:
 
         protocol::Header header;
         header.message_type = protocol::MessageType::kData;
+        header.sequence = next_sequence();
         header.schema_id = schema_id;
         std::byte frame_storage[kMaxFrame];
         ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
@@ -814,6 +885,7 @@ private:
     void control_loop() {
         // Advertise immediately on start, then throttle to hello_interval.
         auto last_hello = std::chrono::steady_clock::now() - config_.hello_interval;
+        auto last_retry = std::chrono::steady_clock::now();
         while (running_.load(std::memory_order_acquire)) {
             maybe_push_schemas();
             if (discovery_ != nullptr) {
@@ -825,6 +897,11 @@ private:
                 for (int i = 0; i < 4; ++i) discovery_->poll_once();
             }
             maybe_expire_peers();
+            const auto retry_now = std::chrono::steady_clock::now();
+            if (retry_now - last_retry >= std::chrono::milliseconds(50)) {
+                retry_pending_requests(retry_now);
+                last_retry = retry_now;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
@@ -864,6 +941,19 @@ private:
     }
 
     // Asks one peer for an exact schema, rate-limited per schema_id.
+    bool send_schema_request_frame(const protocol::SchemaRequest& request,
+                                   const transport::Endpoint& dest) {
+        std::byte payload_storage[32];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!encode_schema_request(request, writer)) return false;
+        protocol::Header header;
+        header.message_type = protocol::MessageType::kSchemaRequest;
+        std::byte frame_storage[64];
+        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+        if (!encode_frame(header, payload_storage, writer.offset(), frame_writer)) return false;
+        return send_to_peer(DataView(frame_storage, frame_writer.offset()), dest);
+    }
+
     void request_schema(SchemaId schema_id, TypeId type_id, Version version,
                         const transport::Endpoint& dest) {
         if (schema_id == 0 || dest.port() == 0) return;
@@ -884,18 +974,76 @@ private:
         request.schema_id = schema_id;
         request.type_id = type_id;
         request.version = version;
+        if (!send_schema_request_frame(request, dest)) return;
+        metrics_.tx_schema_requests++;
 
-        std::byte payload_storage[32];
-        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-        if (!encode_schema_request(request, writer)) return;
+        PendingRequest pending;
+        pending.type = PendingRequestType::kSchema;
+        pending.request_id = request.request_id;
+        pending.type_id = type_id;
+        pending.schema_id = schema_id;
+        pending.version = version;
+        pending.peers.push_back(dest);
+        pending.next_retry = now + std::chrono::milliseconds(200);
+        pending.attempts = 1;
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_requests_[request.request_id] = std::move(pending);
+    }
 
-        protocol::Header header;
-        header.message_type = protocol::MessageType::kSchemaRequest;
-        std::byte frame_storage[64];
-        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
-        if (!encode_frame(header, payload_storage, writer.offset(), frame_writer)) return;
-        if (send_to_peer(DataView(frame_storage, frame_writer.offset()), dest)) {
-            metrics_.tx_schema_requests++;
+    void retry_pending_requests(std::chrono::steady_clock::time_point now) {
+        std::vector<PendingRequest> retries;
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            for (auto it = pending_requests_.begin(); it != pending_requests_.end();) {
+                if (now < it->second.next_retry) {
+                    ++it;
+                    continue;
+                }
+                if (it->second.attempts >= 3) {
+                    it = pending_requests_.erase(it);
+                    continue;
+                }
+                it->second.attempts++;
+                it->second.next_retry = now + std::chrono::milliseconds(200);
+                retries.push_back(it->second);
+                ++it;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(schema_request_mutex_);
+            for (auto it = schema_request_times_.begin();
+                 it != schema_request_times_.end();) {
+                if (now - it->second > std::chrono::seconds(10)) {
+                    it = schema_request_times_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        for (const PendingRequest& pending : retries) {
+            if (pending.type == PendingRequestType::kSchema) {
+                protocol::SchemaRequest request;
+                request.request_id = pending.request_id;
+                request.schema_id = pending.schema_id;
+                request.type_id = pending.type_id;
+                request.version = pending.version;
+                for (const transport::Endpoint& peer : pending.peers) {
+                    if (send_schema_request_frame(request, peer)) {
+                        metrics_.tx_schema_requests++;
+                    }
+                }
+            } else {
+                protocol::SnapshotRequest request;
+                request.request_id = pending.request_id;
+                request.type_id = pending.type_id;
+                for (const transport::Endpoint& peer : pending.peers) {
+                    if (send_snapshot_request_frame(request, peer)) {
+                        metrics_.tx_snapshot_requests++;
+                    }
+                }
+            }
+            metrics_.retry_count++;
         }
     }
 
@@ -941,6 +1089,10 @@ private:
         ByteReader reader(payload);
         protocol::SchemaResponse response;
         if (!decode_schema_response(reader, response)) return;
+        if (response.request_id != 0) {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_requests_.erase(response.request_id);
+        }
         if (registry().register_type(response.descriptor(), response.name_table_size())) {
             metrics_.rx_schema_updates++;
         }
@@ -995,6 +1147,10 @@ private:
     void handle_snapshot_begin(DataView payload, const transport::Endpoint& source) {
         protocol::SnapshotBegin begin;
         if (!protocol::decode_snapshot_begin(payload, begin)) return;
+        if (begin.request_id != 0) {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_requests_.erase(begin.request_id);
+        }
         std::lock_guard<std::mutex> lock(snapshot_mutex_);
         SnapshotStaging staging;
         staging.type_id = begin.type_id;
@@ -1195,6 +1351,21 @@ private:
         return send_to_peer(DataView(frame_storage, writer.offset()), dest);
     }
 
+    bool send_snapshot_request_frame(const protocol::SnapshotRequest& request,
+                                     const transport::Endpoint& dest) {
+        std::byte payload_storage[32];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!protocol::encode_snapshot_request(request, writer)) return false;
+        protocol::Header header;
+        header.message_type = protocol::MessageType::kSnapshotRequest;
+        std::byte frame_storage[64];
+        ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+        if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer)) {
+            return false;
+        }
+        return send_to_peer(DataView(frame_storage, frame_writer.offset()), dest);
+    }
+
     bool send_snapshot_begin(const protocol::SnapshotBegin& begin,
                              const transport::Endpoint& dest) {
         std::byte payload_storage[64];
@@ -1271,12 +1442,17 @@ private:
     ObjectStateStore state_store_;
     protocol::FragmentAssembler assembler_;
     std::atomic<std::uint32_t> next_frame_id_{0};
+    std::atomic<std::uint64_t> tx_sequence_{0};
+    std::map<transport::Endpoint, std::uint64_t> rx_sequences_;
+    std::mutex sequence_mutex_;
     std::atomic<std::uint32_t> next_request_id_{0};
     std::atomic<std::uint32_t> next_snapshot_id_{0};
     std::mutex schema_request_mutex_;
     std::unordered_map<SchemaId, std::chrono::steady_clock::time_point> schema_request_times_;
     std::map<SnapshotKey, SnapshotStaging> snapshots_;
     std::mutex snapshot_mutex_;
+    std::mutex pending_mutex_;
+    std::unordered_map<std::uint32_t, PendingRequest> pending_requests_;
     static constexpr std::size_t kMaxDatagram = 1400;
     std::atomic<bool> delta_enabled_{false};
     std::shared_mutex typed_mutex_;
