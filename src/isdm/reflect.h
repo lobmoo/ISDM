@@ -315,6 +315,24 @@ struct IsReflected : std::false_type {};
 template <typename T>
 struct IsReflected<T, std::void_t<decltype(TypeTraits<T>::field_specs())>> : std::true_type {};
 
+// Nested structs are flattened into dotted leaves. The nested type's own
+// field_specs() names stay relative; each leaf gets the parent prefix and offset.
+template <typename T>
+struct FieldExpander<T, std::enable_if_t<IsReflected<T>::value>> {
+    static std::vector<FieldSpec> Expand(const char* name, std::size_t offset) {
+        std::vector<FieldSpec> out;
+        const auto& leaves = TypeTraits<T>::field_specs();
+        out.reserve(leaves.size());
+        for (const FieldSpec& leaf : leaves) {
+            FieldSpec copy = leaf;
+            copy.name = std::string(name) + "." + leaf.name;
+            copy.offset += offset;
+            out.push_back(std::move(copy));
+        }
+        return out;
+    }
+};
+
 }  // namespace detail
 
 // Owning container returned by describe<T>(). The TypeDescriptor points into
