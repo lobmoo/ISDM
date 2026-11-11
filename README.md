@@ -162,6 +162,15 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 
 注意：wire v0.2，不与 v0.1 节点互操作；复杂类型的 batch/delta、struct 数组/序列和非零默认值本轮尚未实现。
 
+### Schema 版本与演进（M2）
+
+- 帧头 `schema_id` 是 descriptor 指纹；接收端优先精确选择对应版本。
+- `packed` 类型按 `field_id + tag` 解码：末尾追加字段兼容——旧读者跳过未知字段，新读者对缺失字段零默认；删除字段、改类型/元素类型、改数组长度、改字段名（field_id 变化）拒绝。
+- `fixed-raw` 要求精确 `schema_id`；缺失时发 `SchemaRequest` 并丢弃当前帧。
+- `register_type_typed<T>(type_id, version)` 会检查 append-only 兼容性；新版本号必须更高。
+- 接收端缺失 schema 时自动发 `SchemaRequest`，对端回 `SchemaResponse`（带 `request_id/schema_id`）。
+- 覆盖测试：`./build/tests/isdm/isdm_test_schema_evolution`（V1→V2 追加、V1→V3 类型变更拒绝、SchemaRequest 响应、unknown-schema packed fallback）。
+
 ## 架构概览
 
 ```

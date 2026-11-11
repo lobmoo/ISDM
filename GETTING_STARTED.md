@@ -220,6 +220,36 @@ cmake --build build -j"$(nproc)"
 
 注意：wire v0.2，不与 v0.1 节点互操作；复杂类型的 batch/delta、struct 数组/序列和非零默认值本轮尚未实现。
 
+### 6.2 Schema 版本与演进（M2）
+
+同一 `TypeId` 可以注册多个版本；帧头 `schema_id` 是 descriptor 指纹，接收端优先用它精确选择版本。
+
+```cpp
+// 发布端：V2 在 V1 末尾追加 extra 字段（append-only）
+node.register_type_typed<app::MotorV2>(310, 2);
+node.publish_typed(1, 310, motor_v2);
+```
+
+```cpp
+// 订阅端：仍用 V1 类型；packed tag 解码会跳过未知的 extra 字段
+sub.subscribe_typed<app::MotorV1>(310, [](isdm::ObjectId, const app::MotorV1& motor) {
+    // 已知字段 id/values 正常解码
+});
+```
+
+规则：
+
+- `packed`：末尾追加字段兼容；旧读者跳过未知 tag，新读者对缺失字段零默认。
+- `fixed-raw`：必须精确 `schema_id`；缺失时发 `SchemaRequest` 并丢弃当前帧。
+- 删除字段、改字段类型/元素类型、改数组长度、改字段名/字段 ID：拒绝。
+- `register_type_typed<T>(type_id, version)` 会检查 append-only 兼容性，新版本号必须更高。
+
+运行测试：
+
+```bash
+./build/tests/isdm/isdm_test_schema_evolution
+```
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。

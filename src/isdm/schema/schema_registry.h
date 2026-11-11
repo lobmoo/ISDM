@@ -7,7 +7,6 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
-#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -85,11 +84,6 @@ inline SchemaId schema_fingerprint(const TypeDescriptor& descriptor) noexcept {
 
 namespace detail {
 
-inline std::string_view schema_type_name(const TypeDescriptor& descriptor) noexcept {
-    if (descriptor.name_table == nullptr) return {};
-    return std::string_view(descriptor.name_table + descriptor.name_offset);
-}
-
 inline const FieldDescriptor* find_descriptor_field(const TypeDescriptor& descriptor,
                                                     FieldId field_id) noexcept {
     for (std::uint32_t i = 0; i < descriptor.field_count; ++i) {
@@ -115,10 +109,6 @@ inline bool field_compatible(const FieldDescriptor& a, const FieldDescriptor& b)
 inline bool schema_decode_compatible(const TypeDescriptor& reader,
                                      const TypeDescriptor& writer) noexcept {
     if (reader.type_id != writer.type_id || reader.kind != writer.kind) return false;
-    if (!detail::schema_type_name(reader).empty() && !detail::schema_type_name(writer).empty() &&
-        detail::schema_type_name(reader) != detail::schema_type_name(writer)) {
-        return false;
-    }
     if (reader.layout == TypeLayout::kFixedRaw || writer.layout == TypeLayout::kFixedRaw) {
         return reader.layout == writer.layout &&
                schema_fingerprint(reader) == schema_fingerprint(writer);
@@ -137,11 +127,6 @@ inline bool schema_decode_compatible(const TypeDescriptor& reader,
 inline bool schema_evolution_compatible(const TypeDescriptor& previous,
                                         const TypeDescriptor& next) noexcept {
     if (previous.type_id != next.type_id || previous.kind != next.kind) return false;
-    if (!detail::schema_type_name(previous).empty() &&
-        !detail::schema_type_name(next).empty() &&
-        detail::schema_type_name(previous) != detail::schema_type_name(next)) {
-        return false;
-    }
     if (previous.layout == TypeLayout::kFixedRaw || next.layout == TypeLayout::kFixedRaw) {
         return previous.layout == next.layout &&
                schema_fingerprint(previous) == schema_fingerprint(next);
