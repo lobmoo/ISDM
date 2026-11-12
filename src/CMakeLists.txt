@@ -12,11 +12,13 @@ add_library(isdm_core STATIC
     isdm/protocol/data_message.cc
     isdm/protocol/delta.cc
     isdm/protocol/discovery.cc
+    isdm/protocol/event.cc
     isdm/protocol/fragment.cc
     isdm/protocol/frame.cc
     isdm/protocol/schema_sync.cc
     isdm/protocol/schema_wire.cc
     isdm/protocol/snapshot.cc
+    isdm/runtime/event_store.cc
     isdm/runtime/object_state_store.cc
     isdm/schema/schema_registry.cc
     isdm/transport/endpoint.cc

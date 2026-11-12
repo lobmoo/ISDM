@@ -46,6 +46,7 @@ ctest --test-dir build --output-on-failure
 ./build/examples/isdm_demo_pub_sub
 ./build/examples/isdm_demo_complex_types
 ./build/examples/isdm_demo_type_discovery
+./build/examples/isdm_demo_events
 
 # 安装（可选）
 cmake --install build
@@ -246,10 +247,44 @@ subscriber.subscribe_by_name_dynamic("Motor", [](ObjectId, const DynamicObject& 
 - delta 没有 baseline 时会被丢弃（`rx_delta_no_base`）；快照/full publish 用于恢复基线。
 - 控制面的 schema/snapshot 请求有重试；数据面没有。
 
+#### 事件语义（Event）
+
+对象数据是“最新状态”，事件是“发生了什么”。事件不会进入 `ObjectStateStore`，也不参与 snapshot，而是进入独立的有界 `EventStore`。
+
+```cpp
+// 发布：EventId + TypeId + severity + source_timestamp + schema payload
+publisher.publish_event_typed(event_id, type_id, EventSeverity::kWarning, alarm,
+                              source_timestamp);
+
+// 订阅：raw / dynamic / typed / all
+subscriber.subscribe_event(type_id, [](const EventMetadata& meta, DataView payload) {
+    // meta.event_id / severity / source_timestamp / receive_timestamp / source
+});
+subscriber.subscribe_event_dynamic(type_id, [](const EventMetadata& meta,
+                                               const DynamicObject& obj) { /* ... */ });
+subscriber.subscribe_all_events([](const EventMetadata&, DataView) { /* ... */ });
+
+// 晚加入：按类型/时间拉取历史事件；type_id=0 表示所有类型
+subscriber.request_event_replay(type_id, since_source_timestamp, /*max_events=*/1000);
+
+// 事件时间进度：max observed source timestamp - lateness
+subscriber.set_event_watermark_callback([](TypeId type_id, Timestamp watermark) {});
+```
+
+约定与边界：
+
+- `EventMetadata` 同时带 `source_timestamp`（发送端事件时间）和 `receive_timestamp`（本地接收时间）。
+- 去重键是 `(source, event_id)`；重复事件不再派发。
+- 历史有界（条数/字节/接收时间）；被驱逐的事件无法 replay。
+- replay 只由**本地发布过该事件**的节点提供，中继节点不重放自己收到的事件，避免 source 变化导致去重失效。
+- replay 仍是 UDP best-effort，没有 ACK；没有 exactly-once。
+- watermark 是“已观察最大 source timestamp - lateness”的进度信号，不是完整性保证，也不处理跨节点时钟偏差。
+- 新增 `examples/events`，演示晚加入 replay、live 事件和 watermark。
+
 #### 当前尚未实现 / 后续方向
 
-- 独立事件流：event_id / 事件历史 / 回放 / exactly-once；
-- 严格时钟同步与事件时间（watermark）语义；
+- Command / ACK / NACK、事件可靠传输与 exactly-once；
+- 严格时钟同步与完整事件时间（watermark 完整性）语义；
 - 数据面可靠传输（重传/ACK）；
 - 共享内存（SHM）与 60 万+ 数据点的正式验证（README 顶部部分能力属于目标/路线图）。
 
