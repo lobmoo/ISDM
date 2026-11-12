@@ -42,26 +42,42 @@
 namespace isdm {
 
 struct NodeConfig {
+    // 节点唯一标识：必须非 0，且在同一个发现域内唯一。
+    // PeerTable 以 node_id 为主键；node_name 不参与身份判定。
     NodeId node_id = 0;
+    // 人类可读名称，仅用于日志/诊断；允许重复，不要求唯一。
     std::string node_name;
+    // 能力位图（UDP/SHM/TCP/Delta/Batch 等），随 HELLO 广播；当前未做强协商。
     std::uint32_t capabilities = 0;
-    transport::Endpoint advertise_endpoint;   // multicast group for HELLO
+    // 发现用的组播组 + 端口：HELLO 的“发送目标”，不是本地 bind 地址。
+    // 必须是 224.0.0.0/4 组播地址，例如 Endpoint(239, 255, 20, 99, 39999)。
+    transport::Endpoint advertise_endpoint;
+    // 控制面 socket 的“本地 bind 地址”；通常 0.0.0.0:<组播端口>。
+    // 它负责接收 HELLO；端口必须和 advertise_endpoint 的端口一致。
     transport::Endpoint control_bind{0, 0, 0, 0, 0};
+    // 数据面 socket 的“本地 bind 地址”；同机可用 127.0.0.1:0，跨机用 0.0.0.0:0。
+    // 实际端口由 OS 分配后会写进 HELLO 的 data_endpoint，供 peer 单播发送数据。
     transport::Endpoint data_bind{0, 0, 0, 0, 0};
 
-    // When threaded, start() spawns background control + data threads so the
-    // node is usable without a manual pump loop. Set false to drive it with
-    // pump() from your own thread (embedded use).
+    // true：start() 自动启动控制线程 + 数据线程，pump() 是 no-op；
+    // false：不启动线程，由调用方在自己的线程里调用 pump()/run_for()。
     bool threaded = true;
+    // HELLO 发送周期；启动时会立即发一次，之后按该周期发送。
     std::chrono::milliseconds hello_interval{1000};
+    // peer 超过该时间没有 HELLO 就视为离线（需 peer_offline_enabled=true）。
     std::chrono::milliseconds peer_timeout{3000};
-    bool peer_offline_enabled = false;  // enable offline detection + callbacks
+    // 是否启用超时离线检测与回调；GOODBYE 触发的移除不受此开关限制。
+    bool peer_offline_enabled = false;
 
-    // Bounded full-object state store used for snapshot/dedup/delta baselines.
-    std::size_t max_state_objects = 1000000U;
-    std::size_t max_state_bytes = 512ULL * 1024ULL * 1024ULL;
+    // 有界全量对象状态存储：snapshot / 去重 / delta baseline 使用；
+    // 达到上限时按最旧 timestamp 驱逐。
+    std::size_t max_state_objects = 1000000U;                 // 最多保留对象数
+    std::size_t max_state_bytes = 512ULL * 1024ULL * 1024ULL;  // payload 总字节上限
+    // 发送快照时冻结副本的字节上限；超过则中止本次快照。
     std::size_t snapshot_sender_copy_bytes = 64ULL * 1024ULL * 1024ULL;
+    // 接收快照 staging 的字节上限；超过则丢弃该快照。
     std::size_t snapshot_staging_limit_bytes = 64ULL * 1024ULL * 1024ULL;
+    // 接收端 staging 超时；不完整快照会被丢弃。
     std::chrono::milliseconds snapshot_timeout{5000};
 };
 
@@ -124,7 +140,7 @@ public:
         transport::UdpTransport::Config control_config;
         control_config.bind_endpoint = config_.control_bind;
         control_config.multicast_group = config_.advertise_endpoint;
-        control_config.multicast_interface = transport::Endpoint(127, 0, 0, 1, 0);
+        control_config.multicast_interface = transport::Endpoint(127, 0, 0, 1, 0);  //跨主机需要暴漏接口
         control_config.multicast_loopback = true;
         control_ = std::make_unique<transport::UdpTransport>(control_config);
         if (!control_->open()) return false;
