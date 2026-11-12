@@ -87,6 +87,10 @@ class Node {
 public:
     // Receives a published object's struct bytes (zero-copy into the frame).
     using DataCallback = std::function<void(ObjectId, TypeId, DataView, Timestamp)>;
+    // Receives every type, decoded from the sender's schema.
+    using DynamicObjectCallback = std::function<void(ObjectId, const DynamicObject&)>;
+    // Fires when a schema becomes known locally or is synced from a peer.
+    using TypeDiscoveredCallback = std::function<void(const TypeDescriptor&)>;
 
     explicit Node(NodeConfig config);
     ~Node();
@@ -256,6 +260,25 @@ public:
         TypeId type_id,
         std::function<void(ObjectId, const DynamicObject&)> cb);
 
+    // Subscribe to every object, regardless of TypeId. Each object is decoded
+    // once with the sender's schema and delivered to all wildcard callbacks.
+    void subscribe_all_dynamic(DynamicObjectCallback cb);
+
+    // Subscribe by type name. If the schema is not known yet, the subscription
+    // stays pending and is activated when that schema arrives.
+    bool subscribe_by_name_dynamic(const std::string& type_name,
+                                   DynamicObjectCallback cb);
+
+    // Resolves a type name to its TypeId, or 0 if the schema is unknown.
+    // Matches either the full reflected name ("demo::Motor") or its short name
+    // ("Motor"). If several TypeIds match, the first one found is returned.
+    TypeId find_type_id_by_name(const std::string& type_name) const;
+
+    // Called when a schema is registered locally or synced from a peer.
+    // Remote schemas fire from the data thread; the callback must not block or
+    // call Node::stop(). The descriptor stays valid while this Node is alive.
+    void set_type_discovered_callback(TypeDiscoveredCallback cb);
+
     // Delta subscription: the callback always receives the FULL current value.
     // The first full object seeds the cache; subsequent deltas patch it.
     void subscribe_delta(TypeId type_id, DataCallback cb);
@@ -375,6 +398,9 @@ private:
     }
 
     std::shared_ptr<ReflectedType> find_typed_type(TypeId type_id);
+    bool decode_dynamic_object(const IncomingObject& in, DynamicObject& out);
+    void notify_type_discovered(const TypeDescriptor& descriptor);
+    void resolve_name_subscriptions(const TypeDescriptor& descriptor);
     void log_publish_failure(const char* operation, ObjectId object_id, TypeId type_id,
                              const char* reason);
     void log_registration_failure(TypeId type_id, Version version, const char* reason);
@@ -479,6 +505,9 @@ private:
     std::vector<std::pair<TypeId, DataCallback>> by_type_;
     std::vector<std::pair<TypeId, SchemaCallback>> by_type_schema_;
     std::vector<std::pair<ObjectId, DataCallback>> by_object_;
+    std::vector<DynamicObjectCallback> dynamic_all_;
+    std::vector<std::pair<std::string, DynamicObjectCallback>> pending_by_name_;
+    TypeDiscoveredCallback type_discovered_callback_;
     std::unordered_set<NodeId> known_peers_;
     std::array<std::byte, kMaxFrame> recv_{};
     PeerStateCallback peer_state_callback_;

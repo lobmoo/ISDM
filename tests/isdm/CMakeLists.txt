@@ -155,6 +155,11 @@ target_link_libraries(isdm_test_reliability PRIVATE ISDM::core GTest::gtest_main
 target_compile_features(isdm_test_reliability PRIVATE cxx_std_17)
 target_compile_options(isdm_test_reliability PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(isdm_test_type_discovery test_type_discovery.cc)
+target_link_libraries(isdm_test_type_discovery PRIVATE ISDM::core GTest::gtest_main)
+target_compile_features(isdm_test_type_discovery PRIVATE cxx_std_17)
+target_compile_options(isdm_test_type_discovery PRIVATE -Wall -Wextra -Wpedantic)
+
 include(GoogleTest)
 gtest_discover_tests(isdm_test_types)
 gtest_discover_tests(isdm_test_arena_allocator)
@@ -187,3 +192,4 @@ gtest_discover_tests(isdm_test_schema_evolution)
 gtest_discover_tests(isdm_test_object_state_store)
 gtest_discover_tests(isdm_test_snapshot_atomicity)
 gtest_discover_tests(isdm_test_reliability)
+gtest_discover_tests(isdm_test_type_discovery)

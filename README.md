@@ -44,6 +44,8 @@ ctest --test-dir build --output-on-failure
 
 # 运行端到端 Demo
 ./build/examples/isdm_demo_pub_sub
+./build/examples/isdm_demo_complex_types
+./build/examples/isdm_demo_type_discovery
 
 # 安装（可选）
 cmake --install build
@@ -192,21 +194,39 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 
 > **对象状态发布/订阅 + 自动发现 + schema 自描述 + 快照补齐**
 
-#### 三种订阅方式
+#### 订阅方式
 
 | 方式 | API | 订阅端需要知道什么 | 回调拿到什么 |
 |---|---|---|---|
 | 知道对象结构 | `subscribe_typed<T>(type_id, cb)` | `TypeId` + 编译期 `T` | 解码好的 `T` |
 | 动态解析 | `subscribe_dynamic(type_id, cb)` | 只要 `TypeId` | `DynamicObject`（字段名/kind/字节视图） |
 | 用 schema 自己解析 | `subscribe(type_id, cb)` + `registry().find(type_id)` | 只要 `TypeId` | 原始 `DataView`，应用按 `TypeDescriptor` 逐字段读 |
+| 通配动态 | `subscribe_all_dynamic(cb)` | 不需要 `TypeId` | 任意类型的 `DynamicObject` |
+| 按类型名 | `subscribe_by_name_dynamic("Motor", cb)` | 类型名（全名或短名） | 对应类型的 `DynamicObject` |
 
 `simple_pub_sub` 演示了第三种：订阅端不定义 `Motor`，而是用自动同步到的 schema 解析字段。
+`type_discovery` 演示了后两种：订阅端不引用业务结构体，按类型名/通配方式消费。
+
+类型发现相关 API：
+
+```cpp
+subscriber.set_type_discovered_callback([](const TypeDescriptor& desc) {
+    // schema 本地注册或从远端同步后触发
+});
+
+const TypeId id = subscriber.find_type_id_by_name("Motor");  // 未知返回 0
+subscriber.subscribe_by_name_dynamic("Motor", [](ObjectId, const DynamicObject& obj) {
+    // schema 未到达时先挂起，到达后自动激活
+});
+```
 
 注意：
 
-- 三种方式都必须提前知道 `TypeId`；当前没有 `subscribe_all` / 按类型名自动订阅。
-- `subscribe_typed` / `subscribe_dynamic` 的回调不带 timestamp/source；需要时间信息时走 raw `subscribe` 的 `DataCallback`。
+- 前三种方式需要提前知道 `TypeId`；通配/按名订阅不需要。
+- 通配/按名订阅在对应 schema 到达前收到的对象会被丢弃并触发 SchemaRequest；需要补状态时用 `request_snapshot(TypeId)`。
+- `subscribe_typed` / `subscribe_dynamic` / 通配回调不带 timestamp/source；需要时间信息时走 raw `subscribe` 的 `DataCallback`。
 - 如果发布端用原始 `publish()` 且没有注册 schema，数据就只是字节；自描述的前提是发布端注册了 schema。
+- 类型名匹配支持 `demo::Motor` 全名或 `Motor` 短名；短名有歧义时取第一个匹配的 TypeId。
 
 #### 快照语义
 
@@ -228,7 +248,6 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 
 #### 当前尚未实现 / 后续方向
 
-- 通配订阅、按类型名订阅、新类型到达事件；
 - 独立事件流：event_id / 事件历史 / 回放 / exactly-once；
 - 严格时钟同步与事件时间（watermark）语义；
 - 数据面可靠传输（重传/ACK）；

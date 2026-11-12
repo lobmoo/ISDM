@@ -17,6 +17,15 @@ target_link_libraries(isdm_demo_complex_types PRIVATE ISDM::core)
 target_compile_features(isdm_demo_complex_types PRIVATE cxx_std_17)
 target_compile_options(isdm_demo_complex_types PRIVATE -Wall -Wextra -Wpedantic)
 
+# Type discovery: subscriber uses runtime schema only (no business structs).
+add_executable(isdm_demo_type_discovery
+    type_discovery/main.cc
+)
+
+target_link_libraries(isdm_demo_type_discovery PRIVATE ISDM::core)
+target_compile_features(isdm_demo_type_discovery PRIVATE cxx_std_17)
+target_compile_options(isdm_demo_type_discovery PRIVATE -Wall -Wextra -Wpedantic)
+
 # Two-process demo: independent publisher and subscriber executables.
 add_executable(isdm_publisher two_process/publisher.cc)
 target_link_libraries(isdm_publisher PRIVATE ISDM::core)
