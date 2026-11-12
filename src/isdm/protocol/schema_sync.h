@@ -44,45 +44,9 @@ struct SchemaResponse {
     const char* field_name(std::size_t index) const noexcept { return decoded.field_name(index); }
 };
 
-inline bool encode_schema_request(const SchemaRequest& request, ByteWriter& out) noexcept {
-    return out.write(kSchemaSyncMagic) &&
-           out.write(static_cast<std::uint8_t>(SchemaSyncType::kRequest)) &&
-           out.write(request.request_id) && out.write(request.schema_id) &&
-           out.write(request.type_id) && out.write(request.version);
-}
-
-inline bool decode_schema_request(ByteReader& in, SchemaRequest& out) noexcept {
-    std::uint16_t magic = 0;
-    std::uint8_t kind = 0;
-    if (!in.read(magic) || !in.read(kind)) return false;
-    if (magic != kSchemaSyncMagic || kind != static_cast<std::uint8_t>(SchemaSyncType::kRequest)) {
-        return false;
-    }
-    return in.read(out.request_id) && in.read(out.schema_id) && in.read(out.type_id) &&
-           in.read(out.version);
-}
-
-inline bool encode_schema_response(const SchemaResponse& response, ByteWriter& out) noexcept {
-    if (!out.write(kSchemaSyncMagic) ||
-        !out.write(static_cast<std::uint8_t>(SchemaSyncType::kResponse))) {
-        return false;
-    }
-    if (!out.write(response.request_id)) return false;
-    return encode_schema(response.schema, out);
-}
-
-inline bool decode_schema_response(ByteReader& in, SchemaResponse& out) noexcept {
-    std::uint16_t magic = 0;
-    std::uint8_t kind = 0;
-    if (!in.read(magic) || !in.read(kind)) return false;
-    if (magic != kSchemaSyncMagic || kind != static_cast<std::uint8_t>(SchemaSyncType::kResponse)) {
-        return false;
-    }
-    if (!in.read(out.request_id)) return false;
-    out.decoded = DecodedSchema{};
-    if (!decode_schema(in, out.decoded)) return false;
-    out.type_id = out.decoded.desc.type_id;
-    return true;
-}
+bool encode_schema_request(const SchemaRequest& request, ByteWriter& out) noexcept;
+bool decode_schema_request(ByteReader& in, SchemaRequest& out) noexcept;
+bool encode_schema_response(const SchemaResponse& response, ByteWriter& out) noexcept;
+bool decode_schema_response(ByteReader& in, SchemaResponse& out) noexcept;
 
 }  // namespace isdm::protocol

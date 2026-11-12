@@ -13,9 +13,7 @@ namespace isdm {
 // Monotonic preallocated allocator. Individual allocations are not freed.
 class ArenaAllocator {
 public:
-    explicit ArenaAllocator(std::size_t capacity)
-        : storage_(capacity == 0 ? nullptr : std::make_unique<std::byte[]>(capacity)),
-          capacity_(capacity) {}
+    explicit ArenaAllocator(std::size_t capacity);
 
     ArenaAllocator(const ArenaAllocator&) = delete;
     ArenaAllocator& operator=(const ArenaAllocator&) = delete;
@@ -23,27 +21,7 @@ public:
     ArenaAllocator& operator=(ArenaAllocator&&) noexcept = default;
 
     void* allocate(std::size_t size,
-                   std::size_t alignment = alignof(std::max_align_t)) noexcept {
-        if (size == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0) {
-            return nullptr;
-        }
-
-        const auto base = reinterpret_cast<std::uintptr_t>(storage_.get());
-        if (base > std::numeric_limits<std::uintptr_t>::max() - offset_) {
-            return nullptr;
-        }
-        const auto current = base + offset_;
-        const auto remainder = current & (alignment - 1);
-        const auto padding = remainder == 0 ? 0 : alignment - remainder;
-        if (padding > capacity_ - offset_ || size > capacity_ - offset_ - padding) {
-            return nullptr;
-        }
-
-        offset_ += padding;
-        void* result = storage_.get() + offset_;
-        offset_ += size;
-        return result;
-    }
+                   std::size_t alignment = alignof(std::max_align_t)) noexcept;
 
     template <typename T, typename... Args>
     T* make(Args&&... args) {
@@ -53,15 +31,48 @@ public:
                                  : ::new (memory) T(std::forward<Args>(args)...);
     }
 
-    void reset() noexcept { offset_ = 0; }
-    std::size_t capacity() const noexcept { return capacity_; }
-    std::size_t used() const noexcept { return offset_; }
-    std::size_t remaining() const noexcept { return capacity_ - offset_; }
+    void reset() noexcept;
+    std::size_t capacity() const noexcept;
+    std::size_t used() const noexcept;
+    std::size_t remaining() const noexcept;
 
 private:
     std::unique_ptr<std::byte[]> storage_;
     std::size_t capacity_ = 0;
     std::size_t offset_ = 0;
 };
+
+inline ArenaAllocator::ArenaAllocator(std::size_t capacity)
+    : storage_(capacity == 0 ? nullptr : std::make_unique<std::byte[]>(capacity)),
+      capacity_(capacity) {}
+
+inline void* ArenaAllocator::allocate(std::size_t size, std::size_t alignment) noexcept {
+    if (size == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        return nullptr;
+    }
+
+    const auto base = reinterpret_cast<std::uintptr_t>(storage_.get());
+    if (base > std::numeric_limits<std::uintptr_t>::max() - offset_) {
+        return nullptr;
+    }
+    const auto current = base + offset_;
+    const auto remainder = current & (alignment - 1);
+    const auto padding = remainder == 0 ? 0 : alignment - remainder;
+    if (padding > capacity_ - offset_ || size > capacity_ - offset_ - padding) {
+        return nullptr;
+    }
+
+    offset_ += padding;
+    void* result = storage_.get() + offset_;
+    offset_ += size;
+    return result;
+}
+
+inline void ArenaAllocator::reset() noexcept { offset_ = 0; }
+inline std::size_t ArenaAllocator::capacity() const noexcept { return capacity_; }
+inline std::size_t ArenaAllocator::used() const noexcept { return offset_; }
+inline std::size_t ArenaAllocator::remaining() const noexcept {
+    return capacity_ - offset_;
+}
 
 }  // namespace isdm

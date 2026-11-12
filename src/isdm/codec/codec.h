@@ -111,6 +111,8 @@ private:
 
 class StructCodec {
 public:
+    // Kept header-only: this is the fixed-raw zero-copy fast path, called once
+    // per object. Out-of-line calls measurably hurt the codec hot loop.
     static bool is_fixed_layout(const TypeDescriptor& desc) noexcept {
         if (desc.layout == TypeLayout::kPacked) return false;
         for (std::uint32_t i = 0; i < desc.field_count; ++i) {

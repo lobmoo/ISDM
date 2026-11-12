@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(ISDM_BUILD_TESTS "Build ISDM tests" ON)
+option(ISDM_BUILD_TESTS "Build ISDM tests" OFF)
 option(ISDM_BUILD_BENCHMARKS "Build ISDM benchmarks" ON)
 option(ISDM_BUILD_EXAMPLES "Build ISDM examples" ON)
 
@@ -27,4 +27,4 @@ if(ISDM_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif()
 
-install(DIRECTORY src/isdm DESTINATION include)
+install(DIRECTORY src/isdm DESTINATION include FILES_MATCHING PATTERN "*.h")

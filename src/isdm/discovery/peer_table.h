@@ -40,56 +40,18 @@ public:
 
     // Upserts a HELLO-derived peer snapshot. now is supplied by the caller
     // so timeout behavior is deterministic and independent of wall-clock time.
-    PeerEvent upsert(PeerInfo peer, std::chrono::milliseconds now) {
-        if (peer.node_id == 0) return PeerEvent::kInvalid;
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = peers_.find(peer.node_id);
-        if (it == peers_.end()) {
-            peer.last_seen = now;
-            peer.online = true;
-            peers_.emplace(peer.node_id, std::move(peer));
-            return PeerEvent::kOnline;
-        }
+    PeerEvent upsert(PeerInfo peer, std::chrono::milliseconds now);
 
-        const bool was_online = it->second.online;
-        peer.last_seen = now;
-        peer.online = true;
-        it->second = std::move(peer);
-        return was_online ? PeerEvent::kUpdated : PeerEvent::kOnline;
-    }
-
-    const PeerInfo* find(NodeId node_id) const noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = peers_.find(node_id);
-        return it == peers_.end() ? nullptr : &it->second;
-    }
+    const PeerInfo* find(NodeId node_id) const noexcept;
 
     // Marks stale peers offline and returns the number of transitions.
     // Offline entries remain available for reconnect and diagnostics.
     std::size_t expire(std::chrono::milliseconds now,
-                       std::vector<NodeId>* offline = nullptr) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::size_t count = 0;
-        for (auto& item : peers_) {
-            auto& peer = item.second;
-            if (peer.online && now >= peer.last_seen && now - peer.last_seen > timeout_) {
-                peer.online = false;
-                ++count;
-                if (offline != nullptr) offline->push_back(peer.node_id);
-            }
-        }
-        return count;
-    }
+                       std::vector<NodeId>* offline = nullptr);
 
-    bool remove(NodeId node_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return peers_.erase(node_id) != 0;
-    }
+    bool remove(NodeId node_id);
 
-    std::size_t size() const noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return peers_.size();
-    }
+    std::size_t size() const noexcept;
 
     // Applies f to every peer (online or offline) under the internal lock.
     template <typename F>

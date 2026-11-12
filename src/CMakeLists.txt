@@ -1,6 +1,23 @@
 # ISDM core library.
 # Headers and their paired .cc live side-by-side under src/isdm/ (Google style).
 add_library(isdm_core STATIC
+    isdm/codec/object_codec.cc
+    isdm/discovery/discovery_manager.cc
+    isdm/discovery/peer_table.cc
+    isdm/node.cc
+    isdm/protocol/batch_data_message.cc
+    isdm/protocol/crc32c.cc
+    isdm/protocol/data_message.cc
+    isdm/protocol/delta.cc
+    isdm/protocol/discovery.cc
+    isdm/protocol/fragment.cc
+    isdm/protocol/frame.cc
+    isdm/protocol/schema_sync.cc
+    isdm/protocol/schema_wire.cc
+    isdm/protocol/snapshot.cc
+    isdm/runtime/object_state_store.cc
+    isdm/schema/schema_registry.cc
+    isdm/transport/endpoint.cc
     isdm/transport/udp_transport.cc
 )
 
