@@ -186,6 +186,37 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 - 有界状态：ObjectStateStore、snapshot staging、fragment pending、schema request 表都有上限/清理。
 - 覆盖测试：`isdm_test_reliability`。
 
+### 日志
+
+库内部使用项目自带的 `Logger` 组件（spdlog + nlohmann/json）。未初始化时日志静默，应用启动时初始化一次即可：
+
+```cpp
+#include "isdm/logging.h"
+
+int main() {
+    isdm::log::init_console();                    // 控制台，默认 info
+
+    // 其他方式：
+    // isdm::log::init_file("log/isdm.log");      // 只写文件
+    // isdm::log::init_both("log/isdm.log");      // 文件 + 控制台
+    // isdm::log::init_from_config("config/log.json");
+
+    // ... Node 使用 ...
+
+    isdm::log::shutdown();
+}
+```
+
+级别：`trace / debug / info / warning / error / critical`。库内约定：
+
+- `error`：启动失败、socket/bind/组播失败、编码失败、内存分配失败。
+- `warning`：peer 超时、schema 缺失/不兼容、快照丢弃/超限、请求重试耗尽、发送失败（限速）。
+- `info`：节点启停、peer 上线/下线、schema 注册、快照开始/结束。
+- `debug`：订阅注册、schema 请求/重试、快照细节、无在线 peer 等。
+- 高频路径使用 `LOG_TIME(level, interval_ms)` 限速，避免网络异常时刷屏。
+
+`thirdparty/` 不纳入版本管理；本地不存在 spdlog/nlohmann 时 CMake 会自动通过 `FetchContent` 拉取（版本：spdlog v1.15.1、nlohmann/json v3.11.3）。
+
 ## 架构概览
 
 ```

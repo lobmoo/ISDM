@@ -1,5 +1,7 @@
 #include "isdm/runtime/object_state_store.h"
 
+#include "isdm/logging.h"
+
 namespace isdm {
 
 void ObjectStateStore::set_limits(std::size_t max_objects, std::size_t max_bytes) {
@@ -38,7 +40,13 @@ bool ObjectStateStore::upsert(ObjectState state, bool dedup) {
     const std::size_t old_size =
         it == states_.end() ? 0U : it->second.payload.size();
     const std::size_t new_size = state.payload.size();
-    if (new_size > max_bytes_) return false;
+    if (new_size > max_bytes_) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[state] object exceeds store byte limit: type_id=" << state.type_id
+            << " object_id=" << state.object_id << " bytes=" << new_size
+            << " limit=" << max_bytes_;
+        return false;
+    }
 
     while (!states_.empty()) {
         const bool over_objects =
@@ -50,6 +58,11 @@ bool ObjectStateStore::upsert(ObjectState state, bool dedup) {
 
     if (it == states_.end()) {
         if (states_.size() >= max_objects_ || bytes_ + new_size > max_bytes_) {
+            ISDM_LOG_TIME(warning, 1000)
+                << "[state] store full, dropping object type_id=" << state.type_id
+                << " object_id=" << state.object_id << " bytes=" << new_size
+                << " objects=" << states_.size() << "/" << max_objects_
+                << " bytes_used=" << bytes_ << "/" << max_bytes_;
             return false;
         }
         bytes_ += new_size;
@@ -110,6 +123,11 @@ void ObjectStateStore::evict_oldest_locked(const Key* skip_key) {
     }
     if (oldest == states_.end()) return;
     bytes_ -= oldest->second.payload.size();
+    ISDM_LOG_TIME(warning, 1000)
+        << "[state] evicting oldest object type_id=" << oldest->first.type_id
+        << " object_id=" << oldest->first.object_id
+        << " bytes=" << oldest->second.payload.size() << " objects=" << states_.size()
+        << "/" << max_objects_ << " bytes_used=" << bytes_ << "/" << max_bytes_;
     states_.erase(oldest);
 }
 

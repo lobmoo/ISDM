@@ -109,8 +109,16 @@ public:
         auto ref = describe<T>(type_id, version);
         const TypeDescriptor* previous = registry_.find(type_id);
         if (previous != nullptr) {
-            if (version <= previous->version) return false;
-            if (!schema_evolution_compatible(*previous, ref.descriptor())) return false;
+            if (version <= previous->version) {
+                log_registration_failure(type_id, version,
+                                         "version is not greater than existing version");
+                return false;
+            }
+            if (!schema_evolution_compatible(*previous, ref.descriptor())) {
+                log_registration_failure(type_id, version,
+                                         "schema is not append-only compatible");
+                return false;
+            }
         }
         if (!register_type(ref.descriptor(), ref.name_table_size())) return false;
         auto shared = std::make_shared<ReflectedType>(std::move(ref));
@@ -137,13 +145,18 @@ public:
         {
             std::shared_lock<std::shared_mutex> lock(typed_mutex_);
             const auto it = typed_types_.find(type_id);
-            if (it == typed_types_.end()) return false;
+            if (it == typed_types_.end()) {
+                log_publish_failure("publish_typed", object_id, type_id,
+                                    "type is not registered locally");
+                return false;
+            }
             type = it->second;
         }
 
         std::byte payload_storage[kMaxFrame];
         ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
         if (!ObjectCodec::encode(*type, &value, writer)) {
+            log_publish_failure("publish_typed", object_id, type_id, "encode failed");
             metrics_.tx_encode_errors++;
             return false;
         }
@@ -169,9 +182,15 @@ public:
     bool publish_delta_typed(ObjectId object_id, TypeId type_id, const T& new_value,
                              Timestamp ts = 0) {
         auto type = find_typed_type(type_id);
-        if (type == nullptr) return false;
+        if (type == nullptr) {
+            log_publish_failure("publish_delta_typed", object_id, type_id,
+                                "type is not registered locally");
+            return false;
+        }
         const TypeDescriptor& desc = type->descriptor();
         if (desc.layout == TypeLayout::kPacked) {
+            log_publish_failure("publish_delta_typed", object_id, type_id,
+                                "packed layout does not support delta");
             metrics_.tx_unsupported_layout++;
             return false;
         }
@@ -224,6 +243,8 @@ public:
                 if (ObjectCodec::decode(*type, reader, &value)) {
                     cb(in.object_id, value);
                 } else {
+                    log_decode_failure("subscribe_typed", in.object_id, in.type_id,
+                                       in.schema_id);
                     metrics_.rx_decode_errors++;
                 }
             });
@@ -354,6 +375,11 @@ private:
     }
 
     std::shared_ptr<ReflectedType> find_typed_type(TypeId type_id);
+    void log_publish_failure(const char* operation, ObjectId object_id, TypeId type_id,
+                             const char* reason);
+    void log_registration_failure(TypeId type_id, Version version, const char* reason);
+    void log_decode_failure(const char* operation, ObjectId object_id, TypeId type_id,
+                            SchemaId schema_id);
     void subscribe_schema_aware(TypeId type_id, SchemaCallback cb);
 
     // Decides whether the local typed reflection can decode this payload.

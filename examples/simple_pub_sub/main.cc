@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <thread>
 
+#include "isdm/logging.h"
 #include "isdm/node.h"
 #include "isdm/reflect.h"
 #include "isdm/transport/endpoint.h"
@@ -102,6 +103,7 @@ void PrintObject(const isdm::TypeDescriptor& desc, isdm::DataView data) {
 }  // namespace subsys
 
 int main() {
+    isdm::log::init_console();
     const isdm::transport::Endpoint group(239, 255, 20, 99, 39999);
 
     isdm::NodeConfig pub_config;

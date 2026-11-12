@@ -288,6 +288,27 @@ const auto metrics = node.metrics().snapshot();
 ./build/tests/isdm/isdm_test_reliability
 ```
 
+### 6.5 日志
+
+日志组件默认静默，应用启动时初始化一次：
+
+```cpp
+#include "isdm/logging.h"
+
+int main() {
+    isdm::log::init_console();                  // 控制台，默认 info
+    // isdm::log::init_file("log/isdm.log");    // 只写文件
+    // isdm::log::init_both("log/isdm.log");    // 文件 + 控制台
+    // isdm::log::init_from_config("config/log.json");
+
+    // ... Node 使用 ...
+
+    isdm::log::shutdown();
+}
+```
+
+库内约定：`error` 用于启动/网络/编码/分配失败；`warning` 用于 peer 超时、schema 缺失、快照丢弃/超限、重试耗尽；`info` 用于节点启停、peer 上下线、schema 注册、快照开始/结束；`debug` 用于订阅、schema 请求和快照细节。高频错误用 `LOG_TIME(level, interval_ms)` 限速。
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。

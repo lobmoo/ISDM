@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "isdm/discovery/discovery_manager.h"
+#include "isdm/logging.h"
 #include "isdm/protocol/batch_data_message.h"
 #include "isdm/protocol/data_message.h"
 #include "isdm/transport/udp_transport.h"
@@ -33,6 +34,9 @@ bool Node::register_type(const TypeDescriptor& desc, std::size_t name_table_size
             advertised_fingerprints_.end()) {
         advertised_fingerprints_.push_back(fp);
     }
+    ISDM_LOG(info) << "[schema] node registered type_id=" << desc.type_id
+                   << " version=" << desc.version << " fields=" << desc.field_count
+                   << " schema_id=" << fp;
     return true;
 }
 
@@ -45,12 +49,19 @@ bool Node::start() {
     control_config.multicast_interface = transport::Endpoint(127, 0, 0, 1, 0);  //跨主机需要暴漏接口
     control_config.multicast_loopback = true;
     control_ = std::make_unique<transport::UdpTransport>(control_config);
-    if (!control_->open()) return false;
+    if (!control_->open()) {
+        ISDM_LOG(error) << "[node] start failed: control transport open failed, node_id="
+                        << config_.node_id << " bind=" << config_.control_bind.to_string()
+                        << " group=" << config_.advertise_endpoint.to_string();
+        return false;
+    }
 
     transport::UdpTransport::Config data_config;
     data_config.bind_endpoint = config_.data_bind;
     data_ = std::make_unique<transport::UdpTransport>(data_config);
     if (!data_->open()) {
+        ISDM_LOG(error) << "[node] start failed: data transport open failed, node_id="
+                        << config_.node_id << " bind=" << config_.data_bind.to_string();
         control_.reset();
         return false;
     }
@@ -71,10 +82,23 @@ bool Node::start() {
         control_thread_ = std::thread([this] { control_loop(); });
         data_thread_ = std::thread([this] { data_loop(); });
     }
+    ISDM_LOG(info) << "[node] started node_id=" << config_.node_id
+                   << " name=" << config_.node_name
+                   << " control=" << control_->local_endpoint().to_string()
+                   << " data=" << data_->local_endpoint().to_string()
+                   << " advertise=" << config_.advertise_endpoint.to_string()
+                   << " threaded=" << (config_.threaded ? "true" : "false");
     return true;
 }
 
 void Node::stop() noexcept {
+    const bool was_started = started_;
+    if (was_started) {
+        try {
+            ISDM_LOG(info) << "[node] stopping node_id=" << config_.node_id;
+        } catch (...) {
+        }
+    }
     running_ = false;
     started_ = false;
     if (control_thread_.joinable()) control_thread_.join();
@@ -83,6 +107,12 @@ void Node::stop() noexcept {
     discovery_.reset();
     data_.reset();
     control_.reset();
+    if (was_started) {
+        try {
+            ISDM_LOG(info) << "[node] stopped node_id=" << config_.node_id;
+        } catch (...) {
+        }
+    }
 }
 
 bool Node::publish(ObjectId object_id, TypeId type_id, DataView data, Timestamp ts) {
@@ -97,11 +127,19 @@ bool Node::publish(ObjectId object_id, TypeId type_id, DataView data, Timestamp 
 bool Node::publish_dynamic(ObjectId object_id, TypeId type_id, const DynamicObject& obj,
                            Timestamp ts) {
     const TypeDescriptor* descriptor = registry().find(type_id);
-    if (descriptor == nullptr) return false;
+    if (descriptor == nullptr) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_dynamic failed: unknown type_id=" << type_id
+            << " object_id=" << object_id;
+        return false;
+    }
 
     std::byte payload_storage[kMaxFrame];
     ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
     if (!ObjectCodec::encode_dynamic(*descriptor, obj, writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_dynamic encode failed: type_id=" << type_id
+            << " object_id=" << object_id;
         metrics_.tx_encode_errors++;
         return false;
     }
@@ -113,10 +151,23 @@ bool Node::publish_dynamic(ObjectId object_id, TypeId type_id, const DynamicObje
 bool Node::publish_delta(ObjectId object_id, TypeId type_id, const void* old_bytes,
                          const void* new_bytes, std::size_t struct_size, Timestamp ts) {
     (void)old_bytes;  // the authoritative baseline is the state store
-    if (!started_ || new_bytes == nullptr) return false;
+    if (!started_ || new_bytes == nullptr) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_delta rejected: node not started or null payload, type_id="
+            << type_id << " object_id=" << object_id;
+        return false;
+    }
     const TypeDescriptor* desc = registry().find(type_id);
-    if (desc == nullptr || desc->fixed_size != struct_size) return false;
+    if (desc == nullptr || desc->fixed_size != struct_size) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_delta rejected: unknown type or size mismatch, type_id="
+            << type_id << " object_id=" << object_id << " struct_size=" << struct_size;
+        return false;
+    }
     if (desc->layout == TypeLayout::kPacked) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_delta rejected: packed layout, type_id=" << type_id
+            << " object_id=" << object_id;
         metrics_.tx_unsupported_layout++;
         return false;
     }
@@ -126,6 +177,8 @@ bool Node::publish_delta(ObjectId object_id, TypeId type_id, const void* old_byt
     ObjectState base;
     if (!state_store_.get(type_id, object_id, base) ||
         base.payload.size() != struct_size) {
+        ISDM_LOG(debug) << "[node] publish_delta has no baseline, fallback to full: type_id="
+                        << type_id << " object_id=" << object_id;
         metrics_.tx_delta_fallback++;
         return publish_encoded(object_id, type_id, DataView(new_bytes, struct_size),
                                resolved_ts, schema_id);
@@ -135,6 +188,9 @@ bool Node::publish_delta(ObjectId object_id, TypeId type_id, const void* old_byt
     ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
     if (!protocol::encode_delta(*desc, object_id, type_id, resolved_ts,
                                 base.payload.data(), new_bytes, writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_delta encode failed: type_id=" << type_id
+            << " object_id=" << object_id;
         return false;
     }
     protocol::Header header;
@@ -143,8 +199,12 @@ bool Node::publish_delta(ObjectId object_id, TypeId type_id, const void* old_byt
     header.schema_id = schema_id;
     std::byte frame_storage[kMaxFrame];
     ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
-    if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer))
+    if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_delta frame encode failed: type_id=" << type_id
+            << " object_id=" << object_id;
         return false;
+    }
     retain(object_id, type_id, schema_id, new_bytes, struct_size, resolved_ts);
     metrics_.tx_batches++;
     return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
@@ -152,10 +212,17 @@ bool Node::publish_delta(ObjectId object_id, TypeId type_id, const void* old_byt
 
 bool Node::publish_batch(const ObjectId* ids, const void* payloads, std::size_t count,
                          TypeId type_id, std::size_t payload_size, Timestamp ts) {
-    if (!started_ || ids == nullptr || payloads == nullptr || count == 0) return false;
+    if (!started_ || ids == nullptr || payloads == nullptr || count == 0) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_batch rejected: node not started or invalid args, type_id="
+            << type_id << " count=" << count << " payload_size=" << payload_size;
+        return false;
+    }
 
     const TypeDescriptor* descriptor = registry().find(type_id);
     if (descriptor != nullptr && descriptor->layout == TypeLayout::kPacked) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_batch rejected: packed layout, type_id=" << type_id;
         metrics_.tx_unsupported_layout++;
         return false;
     }
@@ -165,6 +232,9 @@ bool Node::publish_batch(const ObjectId* ids, const void* payloads, std::size_t 
     ByteWriter data_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
     if (!protocol::encode_batch_data(ids, static_cast<const std::byte*>(payloads), count,
                                      type_id, resolved_ts, payload_size, data_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_batch encode failed: type_id=" << type_id
+            << " count=" << count << " payload_size=" << payload_size;
         return false;
     }
 
@@ -176,8 +246,12 @@ bool Node::publish_batch(const ObjectId* ids, const void* payloads, std::size_t 
     header.schema_id = schema_id;
     std::byte frame_storage[kMaxFrame];
     ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
-    if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer))
+    if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish_batch frame encode failed: type_id=" << type_id
+            << " count=" << count;
         return false;
+    }
     for (std::size_t i = 0; i < count; ++i) {
         retain(ids[i], type_id, schema_id,
                static_cast<const std::byte*>(payloads) + i * payload_size, payload_size,
@@ -188,6 +262,7 @@ bool Node::publish_batch(const ObjectId* ids, const void* payloads, std::size_t 
 }
 
 void Node::subscribe(TypeId type_id, DataCallback cb) {
+    ISDM_LOG(debug) << "[node] subscribe raw type_id=" << type_id;
     std::lock_guard<std::mutex> lock(callback_mutex_);
     by_type_.emplace_back(type_id, std::move(cb));
 }
@@ -222,6 +297,8 @@ void Node::subscribe_dynamic(
             }
             DynamicObject obj;
             if (!ObjectCodec::decode_dynamic(*descriptor, in.payload, obj)) {
+                log_decode_failure("subscribe_dynamic", in.object_id, in.type_id,
+                                   in.schema_id);
                 metrics_.rx_decode_errors++;
                 return;
             }
@@ -230,11 +307,13 @@ void Node::subscribe_dynamic(
 }
 
 void Node::subscribe_delta(TypeId type_id, DataCallback cb) {
+    ISDM_LOG(debug) << "[node] subscribe delta type_id=" << type_id;
     delta_enabled_.store(true, std::memory_order_release);
     subscribe(type_id, std::move(cb));
 }
 
 void Node::subscribe_object(ObjectId object_id, DataCallback cb) {
+    ISDM_LOG(debug) << "[node] subscribe object_id=" << object_id;
     std::lock_guard<std::mutex> lock(callback_mutex_);
     by_object_.emplace_back(object_id, std::move(cb));
 }
@@ -245,23 +324,39 @@ void Node::set_peer_state_callback(PeerStateCallback cb) {
 }
 
 bool Node::request_snapshot(TypeId type_id) {
-    if (!started_ || discovery_ == nullptr) return false;
+    if (!started_ || discovery_ == nullptr) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] request rejected: node not started, type_id=" << type_id;
+        return false;
+    }
     protocol::SnapshotRequest request;
     request.type_id = type_id;
-    request.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+    // 0 is reserved as "no request" by the response path.
+    request.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed) + 1;
 
     std::vector<transport::Endpoint> peers;
     discovery_->peers().for_each([&](const PeerInfo& peer) {
         if (peer.online) peers.push_back(peer.endpoint);
     });
-    if (peers.empty()) return false;
+    if (peers.empty()) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] request skipped: no online peer, type_id=" << type_id;
+        return false;
+    }
 
     bool sent = false;
     for (const transport::Endpoint& peer : peers) {
         if (send_snapshot_request_frame(request, peer)) sent = true;
     }
-    if (!sent) return false;
+    if (!sent) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] request send failed, type_id=" << type_id
+            << " request_id=" << request.request_id;
+        return false;
+    }
     metrics_.tx_snapshot_requests++;
+    ISDM_LOG(info) << "[snapshot] requested type_id=" << type_id
+                   << " request_id=" << request.request_id << " peers=" << peers.size();
 
     PendingRequest pending;
     pending.type = PendingRequestType::kSnapshot;
@@ -322,6 +417,10 @@ void Node::maybe_push_schemas() {
         const bool is_new = known_peers_.insert(peer.node_id).second;
         if (is_new) {
             targets.push_back(peer.endpoint);
+            ISDM_LOG(info) << "[discovery] peer online node_id=" << peer.node_id
+                           << " name=" << peer.node_name
+                           << " endpoint=" << peer.endpoint.to_string()
+                           << " schemas=" << peer.schema_fingerprints.size();
             if (cb) cb(peer.node_id, true);  // peer came online
         }
     });
@@ -329,6 +428,7 @@ void Node::maybe_push_schemas() {
         if (present.find(*it) == present.end()) {
             const NodeId offline = *it;
             it = known_peers_.erase(it);
+            ISDM_LOG(info) << "[discovery] peer offline node_id=" << offline;
             if (cb) cb(offline, false);  // GOODBYE removed the peer
         } else {
             ++it;
@@ -347,14 +447,23 @@ void Node::push_schemas_to(const transport::Endpoint& peer_endpoint) {
         response.schema_name_table_size = 0;  // names derived from desc.name_table
         std::byte payload_storage[kMaxFrame];
         ByteWriter sync_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-        if (!encode_schema_response(response, sync_writer)) return;
+        if (!encode_schema_response(response, sync_writer)) {
+            ISDM_LOG_TIME(warning, 1000)
+                << "[schema] push schema encode failed, type_id=" << desc.type_id
+                << " to " << peer_endpoint.to_string();
+            return;
+        }
 
         protocol::Header header;
         header.message_type = protocol::MessageType::kSchema;
         std::byte frame_storage[kMaxFrame];
         ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
-        if (!encode_frame(header, payload_storage, sync_writer.offset(), frame_writer))
+        if (!encode_frame(header, payload_storage, sync_writer.offset(), frame_writer)) {
+            ISDM_LOG_TIME(warning, 1000)
+                << "[schema] push schema frame encode failed, type_id=" << desc.type_id
+                << " to " << peer_endpoint.to_string();
             return;
+        }
         send_to_peer(DataView(frame_storage, frame_writer.offset()), peer_endpoint);
     });
 }
@@ -385,6 +494,9 @@ void Node::drain_data() {
 void Node::dispatch_frame(DataView frame_bytes, const transport::Endpoint& source) {
     protocol::Frame frame;
     if (!parse_frame(frame_bytes, frame)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[protocol] drop malformed frame from " << source.to_string()
+            << " bytes=" << frame_bytes.size();
         metrics_.rx_dropped++;
         return;
     }
@@ -405,6 +517,11 @@ void Node::dispatch_frame(DataView frame_bytes, const transport::Endpoint& sourc
         handle_snapshot_payload(frame.payload, source);
     } else if (frame.header.message_type == protocol::MessageType::kSnapshotRequest) {
         handle_snapshot_request(frame.payload, source);
+    } else {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[protocol] unknown message_type="
+            << static_cast<int>(frame.header.message_type) << " from "
+            << source.to_string();
     }
 }
 
@@ -412,12 +529,20 @@ void Node::handle_delta(DataView payload, SchemaId schema_id,
                         const transport::Endpoint& source) {
     if (!delta_enabled_.load(std::memory_order_acquire)) return;
     protocol::DeltaMessage delta;
-    if (!decode_delta(payload, delta)) return;
+    if (!decode_delta(payload, delta)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[protocol] drop malformed delta from " << source.to_string()
+            << " bytes=" << payload.size();
+        return;
+    }
 
     const TypeDescriptor* desc = nullptr;
     if (schema_id != 0) {
         desc = registry().find_by_fingerprint(schema_id);
         if (desc == nullptr) {
+            ISDM_LOG_TIME(warning, 1000)
+                << "[schema] delta references unknown schema_id=" << schema_id
+                << " type_id=" << delta.type_id << " from " << source.to_string();
             metrics_.rx_schema_miss++;
             request_schema(schema_id, delta.type_id, 0, source);
             return;
@@ -429,15 +554,31 @@ void Node::handle_delta(DataView payload, SchemaId schema_id,
 
     ObjectState base;
     if (!state_store_.get(delta.type_id, delta.object_id, base)) {
+        ISDM_LOG(debug) << "[node] delta without baseline, type_id=" << delta.type_id
+                        << " object_id=" << delta.object_id;
         metrics_.rx_delta_no_base++;
         return;
     }
-    if (base.payload.size() != desc->fixed_size) return;
-    if (!protocol::apply_delta(*desc, base.payload.data(), delta)) return;
+    if (base.payload.size() != desc->fixed_size) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] delta baseline size mismatch, type_id=" << delta.type_id
+            << " object_id=" << delta.object_id << " base=" << base.payload.size()
+            << " expected=" << desc->fixed_size;
+        return;
+    }
+    if (!protocol::apply_delta(*desc, base.payload.data(), delta)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] apply_delta failed, type_id=" << delta.type_id
+            << " object_id=" << delta.object_id << " from " << source.to_string();
+        return;
+    }
 
     base.schema_id = schema_id != 0 ? schema_id : base.schema_id;
     base.timestamp = delta.timestamp;
     if (!state_store_.upsert(base, true)) {
+        ISDM_LOG(debug) << "[node] drop stale delta, type_id=" << delta.type_id
+                        << " object_id=" << delta.object_id
+                        << " timestamp=" << delta.timestamp;
         metrics_.rx_stale++;
         return;
     }
@@ -451,7 +592,27 @@ std::shared_ptr<ReflectedType> Node::find_typed_type(TypeId type_id) {
     return it == typed_types_.end() ? nullptr : it->second;
 }
 
+void Node::log_publish_failure(const char* operation, ObjectId object_id, TypeId type_id,
+                               const char* reason) {
+    ISDM_LOG_TIME(warning, 1000)
+        << "[node] " << operation << " rejected: " << reason << " type_id=" << type_id
+        << " object_id=" << object_id;
+}
+
+void Node::log_registration_failure(TypeId type_id, Version version, const char* reason) {
+    ISDM_LOG(warning) << "[schema] register_type_typed rejected: " << reason
+                      << " type_id=" << type_id << " version=" << version;
+}
+
+void Node::log_decode_failure(const char* operation, ObjectId object_id, TypeId type_id,
+                              SchemaId schema_id) {
+    ISDM_LOG_TIME(warning, 1000)
+        << "[codec] " << operation << " decode failed: type_id=" << type_id
+        << " object_id=" << object_id << " schema_id=" << schema_id;
+}
+
 void Node::subscribe_schema_aware(TypeId type_id, SchemaCallback cb) {
+    ISDM_LOG(debug) << "[node] subscribe schema-aware type_id=" << type_id;
     delta_enabled_.store(true, std::memory_order_release);
     std::lock_guard<std::mutex> lock(callback_mutex_);
     by_type_schema_.emplace_back(type_id, std::move(cb));
@@ -462,14 +623,26 @@ bool Node::typed_schema_ok(const ReflectedType& local, const IncomingObject& in)
     const TypeDescriptor* sender = registry().find_by_fingerprint(in.schema_id);
     if (sender != nullptr) {
         if (schema_decode_compatible(local.descriptor(), *sender)) return true;
+        ISDM_LOG_TIME(warning, 1000)
+            << "[schema] decode mismatch: local type_id=" << local.descriptor().type_id
+            << " local_schema=" << schema_fingerprint(local.descriptor())
+            << " sender_schema=" << in.schema_id
+            << " object_id=" << in.object_id;
         metrics_.rx_schema_mismatch++;
         return false;
     }
     if (local.descriptor().layout == TypeLayout::kPacked) {
+        ISDM_LOG(debug) << "[schema] sender schema_id=" << in.schema_id
+                        << " not found, falling back to packed tag decode, type_id="
+                        << in.type_id;
         metrics_.rx_schema_fallback++;
         request_schema(in.schema_id, in.type_id, 0, in.source);
         return true;
     }
+    ISDM_LOG_TIME(warning, 1000)
+        << "[schema] missing sender schema_id=" << in.schema_id
+        << " for fixed-raw type_id=" << in.type_id << " object_id=" << in.object_id
+        << " source=" << in.source.to_string();
     metrics_.rx_schema_miss++;
     request_schema(in.schema_id, in.type_id, 0, in.source);
     return false;
@@ -477,8 +650,18 @@ bool Node::typed_schema_ok(const ReflectedType& local, const IncomingObject& in)
 
 bool Node::publish_encoded(ObjectId object_id, TypeId type_id, DataView data, Timestamp ts,
                            SchemaId schema_id) {
-    if (!started_) return false;
-    if (data.size() > 0xFFFFFFFFull) return false;
+    if (!started_) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish rejected: node not started, type_id=" << type_id
+            << " object_id=" << object_id;
+        return false;
+    }
+    if (data.size() > 0xFFFFFFFFull) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish rejected: payload too large, type_id=" << type_id
+            << " object_id=" << object_id << " bytes=" << data.size();
+        return false;
+    }
 
     protocol::DataMessage message;
     message.object_id = object_id;
@@ -488,7 +671,12 @@ bool Node::publish_encoded(ObjectId object_id, TypeId type_id, DataView data, Ti
 
     std::byte payload_storage[kMaxFrame];
     ByteWriter data_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-    if (!encode_data_message(message, data_writer)) return false;
+    if (!encode_data_message(message, data_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish encode_data_message failed: type_id=" << type_id
+            << " object_id=" << object_id << " bytes=" << data.size();
+        return false;
+    }
 
     protocol::Header header;
     header.message_type = protocol::MessageType::kData;
@@ -497,6 +685,9 @@ bool Node::publish_encoded(ObjectId object_id, TypeId type_id, DataView data, Ti
     std::byte frame_storage[kMaxFrame];
     ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
     if (!encode_frame(header, payload_storage, data_writer.offset(), frame_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[node] publish frame encode failed: type_id=" << type_id
+            << " object_id=" << object_id;
         return false;
     }
 
@@ -514,6 +705,10 @@ bool Node::send_frame_to_peers(DataView frame) {
             if (send_to_peer(frame, peer.endpoint)) sent = true;
         }
     });
+    if (!sent) {
+        ISDM_LOG_TIME(debug, 1000)
+            << "[node] no online peer accepted frame, bytes=" << frame.size();
+    }
     return sent;
 }
 
@@ -524,6 +719,10 @@ bool Node::send_frame_to_known_peers(DataView frame) {
     discovery_->peers().for_each([&](const PeerInfo& peer) {
         if (send_to_peer(frame, peer.endpoint)) sent = true;
     });
+    if (!sent) {
+        ISDM_LOG_TIME(debug, 1000)
+            << "[node] no known peer accepted frame, bytes=" << frame.size();
+    }
     return sent;
 }
 
@@ -544,7 +743,12 @@ void Node::handle_data_payload(DataView payload, SchemaId schema_id,
     if (payload.size() >= 2 &&
         payload.read_at<std::uint16_t>(0) == protocol::kBatchDataMagic) {
         protocol::BatchDataMessage message;
-        if (!decode_batch_data(payload, message)) return;
+        if (!decode_batch_data(payload, message)) {
+            ISDM_LOG_TIME(warning, 1000)
+                << "[protocol] drop malformed batch frame from " << source.to_string()
+                << " bytes=" << payload.size();
+            return;
+        }
         metrics_.rx_objects += message.count();
         for (std::size_t i = 0; i < message.count(); ++i) {
             const bool accepted =
@@ -559,7 +763,12 @@ void Node::handle_data_payload(DataView payload, SchemaId schema_id,
         }
     } else {
         protocol::DataMessage message;
-        if (!decode_data_message(payload, message)) return;
+        if (!decode_data_message(payload, message)) {
+            ISDM_LOG_TIME(warning, 1000)
+                << "[protocol] drop malformed data frame from " << source.to_string()
+                << " bytes=" << payload.size();
+            return;
+        }
         metrics_.rx_objects++;
         const bool accepted = cache_object(message.object_id, message.type_id, schema_id,
                                            message.timestamp, message.payload);
@@ -596,6 +805,7 @@ void Node::pump_once() {
 }
 
 void Node::control_loop() {
+    ISDM_LOG(debug) << "[node] control thread started, node_id=" << config_.node_id;
     // Advertise immediately on start, then throttle to hello_interval.
     auto last_hello = std::chrono::steady_clock::now() - config_.hello_interval;
     auto last_retry = std::chrono::steady_clock::now();
@@ -617,9 +827,11 @@ void Node::control_loop() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    ISDM_LOG(debug) << "[node] control thread stopped, node_id=" << config_.node_id;
 }
 
 void Node::data_loop() {
+    ISDM_LOG(debug) << "[node] data thread started, node_id=" << config_.node_id;
     auto last_evict = std::chrono::steady_clock::now();
     while (running_.load(std::memory_order_acquire)) {
         drain_data();
@@ -631,6 +843,7 @@ void Node::data_loop() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    ISDM_LOG(debug) << "[node] data thread stopped, node_id=" << config_.node_id;
 }
 
 void Node::maybe_expire_peers() {
@@ -646,6 +859,10 @@ void Node::maybe_expire_peers() {
         std::lock_guard<std::mutex> lock(callback_mutex_);
         cb = peer_state_callback_;
     }
+    for (NodeId node_id : offline) {
+        ISDM_LOG(warning) << "[discovery] peer timeout node_id=" << node_id
+                          << " timeout_ms=" << config_.peer_timeout.count();
+    }
     if (cb) {
         for (NodeId node_id : offline) cb(node_id, false);
     }
@@ -655,12 +872,21 @@ bool Node::send_schema_request_frame(const protocol::SchemaRequest& request,
                                      const transport::Endpoint& dest) {
     std::byte payload_storage[32];
     ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-    if (!encode_schema_request(request, writer)) return false;
+    if (!encode_schema_request(request, writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[schema] request encode failed, schema_id=" << request.schema_id
+            << " dest=" << dest.to_string();
+        return false;
+    }
     protocol::Header header;
     header.message_type = protocol::MessageType::kSchemaRequest;
     std::byte frame_storage[64];
     ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
-    if (!encode_frame(header, payload_storage, writer.offset(), frame_writer)) return false;
+    if (!encode_frame(header, payload_storage, writer.offset(), frame_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[schema] request frame encode failed, schema_id=" << request.schema_id;
+        return false;
+    }
     return send_to_peer(DataView(frame_storage, frame_writer.offset()), dest);
 }
 
@@ -680,12 +906,22 @@ void Node::request_schema(SchemaId schema_id, TypeId type_id, Version version,
     }
 
     protocol::SchemaRequest request;
-    request.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+    // 0 is reserved as "no request" by the response path.
+    request.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed) + 1;
     request.schema_id = schema_id;
     request.type_id = type_id;
     request.version = version;
-    if (!send_schema_request_frame(request, dest)) return;
+    if (!send_schema_request_frame(request, dest)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[schema] request send failed, schema_id=" << schema_id
+            << " type_id=" << type_id << " dest=" << dest.to_string();
+        return;
+    }
     metrics_.tx_schema_requests++;
+    ISDM_LOG(debug) << "[schema] requested schema_id=" << schema_id
+                    << " type_id=" << type_id << " version=" << version
+                    << " request_id=" << request.request_id
+                    << " dest=" << dest.to_string();
 
     PendingRequest pending;
     pending.type = PendingRequestType::kSchema;
@@ -710,12 +946,22 @@ void Node::retry_pending_requests(std::chrono::steady_clock::time_point now) {
                 continue;
             }
             if (it->second.attempts >= 3) {
+                ISDM_LOG(warning) << "[schema] request gave up after 3 attempts, request_id="
+                                  << it->second.request_id
+                                  << " type_id=" << it->second.type_id
+                                  << " schema_id=" << it->second.schema_id
+                                  << " kind="
+                                  << (it->second.type == PendingRequestType::kSchema
+                                          ? "schema"
+                                          : "snapshot");
                 it = pending_requests_.erase(it);
                 continue;
             }
             it->second.attempts++;
             it->second.next_retry = now + std::chrono::milliseconds(200);
             retries.push_back(it->second);
+            ISDM_LOG(debug) << "[schema] retry request_id=" << it->second.request_id
+                            << " attempt=" << it->second.attempts;
             ++it;
         }
     }
@@ -766,20 +1012,34 @@ void Node::send_schema_response(const TypeDescriptor& descriptor, std::uint32_t 
 
     std::byte payload_storage[kMaxFrame];
     ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-    if (!encode_schema_response(response, writer)) return;
+    if (!encode_schema_response(response, writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[schema] response encode failed, request_id=" << request_id
+            << " type_id=" << descriptor.type_id;
+        return;
+    }
 
     protocol::Header header;
     header.message_type = protocol::MessageType::kSchema;
     std::byte frame_storage[kMaxFrame];
     ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
-    if (!encode_frame(header, payload_storage, writer.offset(), frame_writer)) return;
+    if (!encode_frame(header, payload_storage, writer.offset(), frame_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[schema] response frame encode failed, request_id=" << request_id
+            << " type_id=" << descriptor.type_id;
+        return;
+    }
     send_to_peer(DataView(frame_storage, frame_writer.offset()), dest);
 }
 
 void Node::handle_schema_request(DataView payload, const transport::Endpoint& source) {
     ByteReader reader(payload);
     protocol::SchemaRequest request;
-    if (!decode_schema_request(reader, request)) return;
+    if (!decode_schema_request(reader, request)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[schema] malformed schema request from " << source.to_string();
+        return;
+    }
 
     const TypeDescriptor* descriptor = nullptr;
     if (request.schema_id != 0) {
@@ -791,20 +1051,33 @@ void Node::handle_schema_request(DataView payload, const transport::Endpoint& so
     if (descriptor == nullptr && request.type_id != 0) {
         descriptor = registry().find(request.type_id);
     }
-    if (descriptor == nullptr) return;
+    if (descriptor == nullptr) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[schema] request for unknown schema: request_id=" << request.request_id
+            << " schema_id=" << request.schema_id << " type_id=" << request.type_id
+            << " version=" << request.version << " from " << source.to_string();
+        return;
+    }
     send_schema_response(*descriptor, request.request_id, source);
 }
 
 void Node::handle_schema_response(DataView payload) {
     ByteReader reader(payload);
     protocol::SchemaResponse response;
-    if (!decode_schema_response(reader, response)) return;
+    if (!decode_schema_response(reader, response)) {
+        ISDM_LOG_TIME(warning, 1000) << "[schema] malformed schema response, bytes="
+                                     << payload.size();
+        return;
+    }
     if (response.request_id != 0) {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_requests_.erase(response.request_id);
     }
     if (registry().register_type(response.descriptor(), response.name_table_size())) {
         metrics_.rx_schema_updates++;
+        ISDM_LOG(debug) << "[schema] received schema type_id=" << response.type_id
+                        << " version=" << response.descriptor().version
+                        << " request_id=" << response.request_id;
     }
 }
 
@@ -825,7 +1098,14 @@ void Node::retain(ObjectId object_id, TypeId type_id, SchemaId schema_id, const 
 void Node::handle_snapshot_request(DataView payload, const transport::Endpoint& source) {
     ByteReader reader(payload);
     protocol::SnapshotRequest request;
-    if (!decode_snapshot_request(reader, request)) return;
+    if (!decode_snapshot_request(reader, request)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] malformed snapshot request from " << source.to_string();
+        return;
+    }
+    ISDM_LOG(info) << "[snapshot] serving type_id=" << request.type_id
+                   << " request_id=" << request.request_id
+                   << " to " << source.to_string();
     push_schemas_to(source);
     reply_snapshot(request.type_id, request.request_id, source);
 }
@@ -835,7 +1115,12 @@ void Node::handle_snapshot_payload(DataView payload, const transport::Endpoint& 
     std::uint16_t magic = 0;
     std::uint8_t kind = 0;
     if (!reader.read(magic) || !reader.read(kind)) return;
-    if (magic != protocol::kSnapshotMagic) return;
+    if (magic != protocol::kSnapshotMagic) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] invalid magic from " << source.to_string()
+            << " bytes=" << payload.size();
+        return;
+    }
 
     switch (static_cast<protocol::SnapshotKind>(kind)) {
         case protocol::SnapshotKind::kBegin:
@@ -854,7 +1139,11 @@ void Node::handle_snapshot_payload(DataView payload, const transport::Endpoint& 
 
 void Node::handle_snapshot_begin(DataView payload, const transport::Endpoint& source) {
     protocol::SnapshotBegin begin;
-    if (!protocol::decode_snapshot_begin(payload, begin)) return;
+    if (!protocol::decode_snapshot_begin(payload, begin)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] malformed begin from " << source.to_string();
+        return;
+    }
     if (begin.request_id != 0) {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_requests_.erase(begin.request_id);
@@ -867,22 +1156,39 @@ void Node::handle_snapshot_begin(DataView payload, const transport::Endpoint& so
     staging.last_update = std::chrono::steady_clock::now();
     snapshots_[SnapshotKey{source, begin.snapshot_id}] = std::move(staging);
     metrics_.rx_snapshot_begin++;
+    ISDM_LOG(info) << "[snapshot] begin snapshot_id=" << begin.snapshot_id
+                   << " type_id=" << begin.type_id
+                   << " request_id=" << begin.request_id
+                   << " expected=" << begin.expected_count
+                   << " from " << source.to_string();
 }
 
 void Node::handle_snapshot_chunk(DataView payload, const transport::Endpoint& source) {
     protocol::SnapshotChunk chunk;
-    if (!protocol::decode_snapshot_chunk(payload, chunk)) return;
+    if (!protocol::decode_snapshot_chunk(payload, chunk)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] malformed chunk from " << source.to_string();
+        return;
+    }
 
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
     const auto it = snapshots_.find(SnapshotKey{source, chunk.snapshot_id});
     if (it == snapshots_.end()) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] chunk without begin snapshot_id=" << chunk.snapshot_id
+            << " chunk=" << chunk.chunk_index << "/" << chunk.chunk_count
+            << " from " << source.to_string();
         metrics_.snapshot_discarded++;
         return;
     }
     SnapshotStaging& staging = it->second;
     staging.last_update = std::chrono::steady_clock::now();
     staging.chunk_count = chunk.chunk_count;
-    if (!staging.seen_chunks.insert(chunk.chunk_index).second) return;
+    if (!staging.seen_chunks.insert(chunk.chunk_index).second) {
+        ISDM_LOG(debug) << "[snapshot] duplicate chunk snapshot_id=" << chunk.snapshot_id
+                        << " chunk=" << chunk.chunk_index;
+        return;
+    }
 
     for (const protocol::SnapshotChunkEntry& entry : chunk.entries) {
         const auto existing = staging.objects.find(entry.object_id);
@@ -903,6 +1209,11 @@ void Node::handle_snapshot_chunk(DataView payload, const transport::Endpoint& so
     }
 
     if (staging.bytes > config_.snapshot_staging_limit_bytes) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] staging overflow snapshot_id=" << chunk.snapshot_id
+            << " bytes=" << staging.bytes
+            << " limit=" << config_.snapshot_staging_limit_bytes
+            << " from " << source.to_string();
         snapshots_.erase(it);
         metrics_.snapshot_overflow++;
         return;
@@ -912,7 +1223,11 @@ void Node::handle_snapshot_chunk(DataView payload, const transport::Endpoint& so
 
 void Node::handle_snapshot_end(DataView payload, const transport::Endpoint& source) {
     protocol::SnapshotEnd end;
-    if (!protocol::decode_snapshot_end(payload, end)) return;
+    if (!protocol::decode_snapshot_end(payload, end)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] malformed end from " << source.to_string();
+        return;
+    }
 
     std::vector<SnapshotStagedObject> staged;
     TypeId type_id = 0;
@@ -920,6 +1235,9 @@ void Node::handle_snapshot_end(DataView payload, const transport::Endpoint& sour
         std::lock_guard<std::mutex> lock(snapshot_mutex_);
         const auto it = snapshots_.find(SnapshotKey{source, end.snapshot_id});
         if (it == snapshots_.end()) {
+            ISDM_LOG_TIME(warning, 1000)
+                << "[snapshot] end without begin snapshot_id=" << end.snapshot_id
+                << " from " << source.to_string();
             metrics_.snapshot_discarded++;
             return;
         }
@@ -929,6 +1247,13 @@ void Node::handle_snapshot_end(DataView payload, const transport::Endpoint& sour
                               staging.objects.size() == staging.expected_count &&
                               end.sent_count == staging.expected_count;
         if (!complete) {
+            ISDM_LOG(warning) << "[snapshot] incomplete snapshot_id=" << end.snapshot_id
+                              << " type_id=" << staging.type_id
+                              << " chunks=" << staging.seen_chunks.size() << "/"
+                              << staging.chunk_count << " objects="
+                              << staging.objects.size() << "/" << staging.expected_count
+                              << " sent=" << end.sent_count
+                              << " from " << source.to_string();
             snapshots_.erase(it);
             metrics_.snapshot_incomplete++;
             return;
@@ -960,12 +1285,21 @@ void Node::handle_snapshot_end(DataView payload, const transport::Endpoint& sour
         }
     }
     metrics_.snapshot_received++;
+    ISDM_LOG(info) << "[snapshot] received snapshot_id=" << end.snapshot_id
+                   << " type_id=" << type_id << " objects=" << staged.size()
+                   << " from " << source.to_string();
 }
 
 void Node::expire_snapshots(std::chrono::steady_clock::time_point now) {
     std::lock_guard<std::mutex> lock(snapshot_mutex_);
     for (auto it = snapshots_.begin(); it != snapshots_.end();) {
         if (now - it->second.last_update > config_.snapshot_timeout) {
+            ISDM_LOG_TIME(warning, 1000)
+                << "[snapshot] timeout snapshot_id=" << it->first.snapshot_id
+                << " type_id=" << it->second.type_id
+                << " source=" << it->first.source.to_string()
+                << " chunks=" << it->second.seen_chunks.size()
+                << " objects=" << it->second.objects.size();
             it = snapshots_.erase(it);
             metrics_.snapshot_discarded++;
         } else {
@@ -980,6 +1314,11 @@ void Node::reply_snapshot(TypeId type_id, std::uint32_t request_id,
     std::size_t total_bytes = 0;
     for (const ObjectState& object : objects) total_bytes += object.payload.size();
     if (total_bytes > config_.snapshot_sender_copy_bytes) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] sender copy overflow type_id=" << type_id
+            << " bytes=" << total_bytes
+            << " limit=" << config_.snapshot_sender_copy_bytes
+            << " request_id=" << request_id;
         metrics_.snapshot_sender_overflow++;
         return;
     }
@@ -994,10 +1333,18 @@ void Node::reply_snapshot(TypeId type_id, std::uint32_t request_id,
     for (const ObjectState& object : objects) {
         if (kChunkHeaderSize + kEntryHeaderSize + object.payload.size() >
             kPayloadLimit) {
+            ISDM_LOG_TIME(warning, 1000)
+                << "[snapshot] skip object too large for one chunk type_id=" << type_id
+                << " object_id=" << object.object_id
+                << " bytes=" << object.payload.size();
             continue;
         }
         sendable.push_back(&object);
     }
+    ISDM_LOG(info) << "[snapshot] sending type_id=" << type_id
+                   << " request_id=" << request_id << " objects=" << sendable.size()
+                   << " skipped=" << (objects.size() - sendable.size())
+                   << " to " << dest.to_string();
 
     const std::uint32_t snapshot_id =
         next_snapshot_id_.fetch_add(1, std::memory_order_relaxed);
@@ -1044,6 +1391,9 @@ void Node::reply_snapshot(TypeId type_id, std::uint32_t request_id,
     end.sent_count = static_cast<std::uint32_t>(sendable.size());
     end.chunk_count = static_cast<std::uint32_t>(chunks.size());
     send_snapshot_end(end, dest);
+    ISDM_LOG(info) << "[snapshot] sent snapshot_id=" << snapshot_id
+                   << " type_id=" << type_id << " objects=" << sendable.size()
+                   << " chunks=" << chunks.size() << " to " << dest.to_string();
 }
 
 bool Node::send_snapshot_frame(protocol::MessageType type, DataView payload,
@@ -1052,7 +1402,12 @@ bool Node::send_snapshot_frame(protocol::MessageType type, DataView payload,
     ByteWriter writer(MutableDataView(frame_storage, sizeof(frame_storage)));
     protocol::Header header;
     header.message_type = type;
-    if (!encode_frame(header, payload.data(), payload.size(), writer)) return false;
+    if (!encode_frame(header, payload.data(), payload.size(), writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] frame encode failed, bytes=" << payload.size()
+            << " dest=" << dest.to_string();
+        return false;
+    }
     return send_to_peer(DataView(frame_storage, writer.offset()), dest);
 }
 
@@ -1060,12 +1415,18 @@ bool Node::send_snapshot_request_frame(const protocol::SnapshotRequest& request,
                                        const transport::Endpoint& dest) {
     std::byte payload_storage[32];
     ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-    if (!protocol::encode_snapshot_request(request, writer)) return false;
+    if (!protocol::encode_snapshot_request(request, writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] request encode failed, request_id=" << request.request_id;
+        return false;
+    }
     protocol::Header header;
     header.message_type = protocol::MessageType::kSnapshotRequest;
     std::byte frame_storage[64];
     ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
     if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] request frame encode failed, request_id=" << request.request_id;
         return false;
     }
     return send_to_peer(DataView(frame_storage, frame_writer.offset()), dest);
@@ -1075,7 +1436,11 @@ bool Node::send_snapshot_begin(const protocol::SnapshotBegin& begin,
                                const transport::Endpoint& dest) {
     std::byte payload_storage[64];
     ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-    if (!protocol::encode_snapshot_begin(begin, writer)) return false;
+    if (!protocol::encode_snapshot_begin(begin, writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] begin encode failed, snapshot_id=" << begin.snapshot_id;
+        return false;
+    }
     metrics_.tx_snapshot_begin++;
     return send_snapshot_frame(protocol::MessageType::kSnapshot,
                                DataView(payload_storage, writer.offset()), dest);
@@ -1085,7 +1450,12 @@ bool Node::send_snapshot_chunk(const protocol::SnapshotChunk& chunk,
                                const transport::Endpoint& dest) {
     std::byte payload_storage[kMaxFrame];
     ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-    if (!protocol::encode_snapshot_chunk(chunk, writer)) return false;
+    if (!protocol::encode_snapshot_chunk(chunk, writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] chunk encode failed, snapshot_id=" << chunk.snapshot_id
+            << " chunk=" << chunk.chunk_index << "/" << chunk.chunk_count;
+        return false;
+    }
     metrics_.tx_snapshot_chunk++;
     return send_snapshot_frame(protocol::MessageType::kSnapshot,
                                DataView(payload_storage, writer.offset()), dest);
@@ -1095,7 +1465,11 @@ bool Node::send_snapshot_end(const protocol::SnapshotEnd& end,
                              const transport::Endpoint& dest) {
     std::byte payload_storage[64];
     ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
-    if (!protocol::encode_snapshot_end(end, writer)) return false;
+    if (!protocol::encode_snapshot_end(end, writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] end encode failed, snapshot_id=" << end.snapshot_id;
+        return false;
+    }
     metrics_.tx_snapshot_end++;
     return send_snapshot_frame(protocol::MessageType::kSnapshot,
                                DataView(payload_storage, writer.offset()), dest);

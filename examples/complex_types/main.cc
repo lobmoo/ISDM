@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "isdm/isdm.h"
+#include "isdm/logging.h"
 
 namespace demo {
 
@@ -66,6 +67,7 @@ void WaitForSchema(const isdm::Node& subscriber) {
 }  // namespace
 
 int main() {
+    isdm::log::init_console();
     const isdm::transport::Endpoint group(239, 255, 20, 101, 40001);
 
     isdm::NodeConfig publisher_config;

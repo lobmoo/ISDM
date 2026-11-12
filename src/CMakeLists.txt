@@ -4,6 +4,8 @@ add_library(isdm_core STATIC
     isdm/codec/object_codec.cc
     isdm/discovery/discovery_manager.cc
     isdm/discovery/peer_table.cc
+    isdm/log/logger.cc
+    isdm/log/logger_impl.cc
     isdm/node.cc
     isdm/protocol/batch_data_message.cc
     isdm/protocol/crc32c.cc
@@ -25,10 +27,17 @@ target_include_directories(isdm_core
     PUBLIC
         ${CMAKE_SOURCE_DIR}/src
 )
+target_include_directories(isdm_core SYSTEM PRIVATE
+    ${ISDM_SPDLOG_INCLUDE_DIR}
+    ${ISDM_NLOHMANN_INCLUDE_DIR}
+)
 
 target_compile_features(isdm_core PUBLIC cxx_std_17)
 target_compile_options(isdm_core PRIVATE -Wall -Wextra -Wpedantic)
 find_package(Threads REQUIRED)
 target_link_libraries(isdm_core PUBLIC Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10)
+    target_link_libraries(isdm_core PRIVATE stdc++fs)
+endif()
 
 add_library(ISDM::core ALIAS isdm_core)

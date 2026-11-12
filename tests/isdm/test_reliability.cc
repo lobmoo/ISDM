@@ -12,6 +12,7 @@
 #include "isdm/isdm.h"
 #include "isdm/protocol/data_message.h"
 #include "isdm/protocol/frame.h"
+#include "isdm/protocol/schema_sync.h"
 #include "isdm/transport/udp_transport.h"
 
 namespace isdm::test {
@@ -82,8 +83,18 @@ public:
                0;
     }
 
+    // Pops one received frame, if any. The payload points into recv_.
+    bool receive(protocol::Frame& frame) {
+        transport::Endpoint source;
+        const std::size_t size =
+            transport_->receive_from(MutableDataView(recv_.data(), recv_.size()), source);
+        if (size == 0) return false;
+        return protocol::parse_frame(DataView(recv_.data(), size), frame);
+    }
+
 private:
     std::unique_ptr<transport::UdpTransport> transport_;
+    std::array<std::byte, 2048> recv_{};
 };
 
 std::array<std::byte, 4> MakeValue(std::uint32_t value) {
@@ -136,6 +147,25 @@ TEST(ReliabilityTest, SchemaRequestRetries) {
     EXPECT_GE(node.metrics().tx_schema_requests, 2U);
     EXPECT_GE(node.metrics().retry_count, 1U);
     EXPECT_EQ(calls.load(), 0);
+
+    // request_id 0 is reserved for "no request"; generated ids must be non-zero.
+    bool saw_request = false;
+    for (int i = 0; i < 50 && !saw_request; ++i) {
+        protocol::Frame frame;
+        while (client.receive(frame)) {
+            if (frame.header.message_type != protocol::MessageType::kSchemaRequest) {
+                continue;
+            }
+            ByteReader reader(frame.payload);
+            protocol::SchemaRequest request;
+            ASSERT_TRUE(protocol::decode_schema_request(reader, request));
+            EXPECT_NE(request.request_id, 0U);
+            saw_request = true;
+            break;
+        }
+        if (!saw_request) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(saw_request);
     node.stop();
 }
 

@@ -8,8 +8,10 @@
 #include <thread>
 
 #include "common.h"
+#include "isdm/logging.h"
 
 int main() {
+    isdm::log::init_console();
     isdm::Node publisher(app::MakeConfig(101, "publisher"));
     const auto ref = isdm::describe<app::Motor>(app::kMotorTypeId, 1);
     publisher.register_type(ref.descriptor(), ref.name_table_size());

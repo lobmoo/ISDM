@@ -11,8 +11,10 @@
 #include <thread>
 
 #include "common.h"
+#include "isdm/logging.h"
 
 int main() {
+    isdm::log::init_console();
     isdm::Node subscriber(app::MakeConfig(202, "subscriber"));
     if (!subscriber.start()) {
         std::printf("[subscriber] failed to start\n");

@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "isdm/logging.h"
+
 namespace isdm {
 namespace {
 
@@ -114,16 +116,27 @@ bool SchemaRegistry::register_type(const TypeDescriptor& descriptor,
     if (descriptor.type_id == 0 || descriptor.version == 0 ||
         (descriptor.field_count != 0U && descriptor.fields == nullptr) ||
         descriptor.name_table == nullptr || name_table_size == 0U) {
+        ISDM_LOG(warning) << "[schema] reject invalid descriptor: type_id="
+                          << descriptor.type_id << " version=" << descriptor.version
+                          << " fields=" << descriptor.field_count;
         return false;
     }
     if (descriptor.layout != TypeLayout::kFixedRaw &&
         descriptor.layout != TypeLayout::kPacked) {
+        ISDM_LOG(warning) << "[schema] reject type_id=" << descriptor.type_id
+                          << ": invalid layout=" << static_cast<int>(descriptor.layout);
         return false;
     }
     for (std::uint32_t i = 0; i < descriptor.field_count; ++i) {
-        if (descriptor.fields[i].field_id == 0) return false;
+        if (descriptor.fields[i].field_id == 0) {
+            ISDM_LOG(warning) << "[schema] reject type_id=" << descriptor.type_id
+                              << ": field index " << i << " has field_id 0";
+            return false;
+        }
         for (std::uint32_t j = i + 1; j < descriptor.field_count; ++j) {
             if (descriptor.fields[i].field_id == descriptor.fields[j].field_id) {
+                ISDM_LOG(warning) << "[schema] reject type_id=" << descriptor.type_id
+                                  << ": duplicate field_id=" << descriptor.fields[i].field_id;
                 return false;
             }
         }
@@ -132,33 +145,64 @@ bool SchemaRegistry::register_type(const TypeDescriptor& descriptor,
     const SchemaId fingerprint = schema_fingerprint(descriptor);
     std::unique_lock<std::shared_mutex> lock(mutex_);
     const Key key{descriptor.type_id, descriptor.version};
-    if (entries_.find(key) != entries_.end()) return false;
+    if (entries_.find(key) != entries_.end()) {
+        lock.unlock();
+        ISDM_LOG(debug) << "[schema] skip existing type_id=" << descriptor.type_id
+                        << " version=" << descriptor.version;
+        return false;
+    }
     // Keep the first descriptor for a wire identity. A remote packed
     // descriptor with the same fingerprint but different local offsets is
     // therefore a no-op rather than a replacement.
-    if (by_fingerprint_.find(fingerprint) != by_fingerprint_.end()) return false;
+    if (by_fingerprint_.find(fingerprint) != by_fingerprint_.end()) {
+        lock.unlock();
+        ISDM_LOG(debug) << "[schema] skip duplicate fingerprint schema_id=" << fingerprint
+                        << " type_id=" << descriptor.type_id;
+        return false;
+    }
 
     auto* stored = arena_.make<TypeDescriptor>(descriptor);
-    if (stored == nullptr) return false;
+    if (stored == nullptr) {
+        lock.unlock();
+        ISDM_LOG(error) << "[schema] registry arena exhausted while storing type_id="
+                        << descriptor.type_id;
+        return false;
+    }
 
     FieldDescriptor* fields = nullptr;
     if (descriptor.field_count != 0U) {
         fields = static_cast<FieldDescriptor*>(
             arena_.allocate(sizeof(FieldDescriptor) * descriptor.field_count,
                             alignof(FieldDescriptor)));
-        if (fields == nullptr) return false;
+        if (fields == nullptr) {
+            lock.unlock();
+            ISDM_LOG(error) << "[schema] registry arena exhausted for fields, type_id="
+                            << descriptor.type_id;
+            return false;
+        }
         std::memcpy(fields, descriptor.fields,
                     sizeof(FieldDescriptor) * descriptor.field_count);
     }
 
     char* names = static_cast<char*>(arena_.allocate(name_table_size, alignof(char)));
-    if (names == nullptr) return false;
+    if (names == nullptr) {
+        lock.unlock();
+        ISDM_LOG(error) << "[schema] registry arena exhausted for names, type_id="
+                        << descriptor.type_id;
+        return false;
+    }
     std::memcpy(names, descriptor.name_table, name_table_size);
 
     stored->fields = fields;
     stored->name_table = names;
     entries_.emplace(key, stored);
     by_fingerprint_.emplace(fingerprint, stored);
+    lock.unlock();
+    ISDM_LOG(debug) << "[schema] registered type_id=" << descriptor.type_id
+                    << " version=" << descriptor.version << " fields="
+                    << descriptor.field_count << " layout="
+                    << (descriptor.layout == TypeLayout::kPacked ? "packed" : "fixed-raw")
+                    << " schema_id=" << fingerprint;
     return true;
 }
 
