@@ -186,6 +186,54 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 - 有界状态：ObjectStateStore、snapshot staging、fragment pending、schema request 表都有上限/清理。
 - 覆盖测试：`isdm_test_reliability`。
 
+### 订阅模型与当前边界
+
+当前核心模型可以概括为：
+
+> **对象状态发布/订阅 + 自动发现 + schema 自描述 + 快照补齐**
+
+#### 三种订阅方式
+
+| 方式 | API | 订阅端需要知道什么 | 回调拿到什么 |
+|---|---|---|---|
+| 知道对象结构 | `subscribe_typed<T>(type_id, cb)` | `TypeId` + 编译期 `T` | 解码好的 `T` |
+| 动态解析 | `subscribe_dynamic(type_id, cb)` | 只要 `TypeId` | `DynamicObject`（字段名/kind/字节视图） |
+| 用 schema 自己解析 | `subscribe(type_id, cb)` + `registry().find(type_id)` | 只要 `TypeId` | 原始 `DataView`，应用按 `TypeDescriptor` 逐字段读 |
+
+`simple_pub_sub` 演示了第三种：订阅端不定义 `Motor`，而是用自动同步到的 schema 解析字段。
+
+注意：
+
+- 三种方式都必须提前知道 `TypeId`；当前没有 `subscribe_all` / 按类型名自动订阅。
+- `subscribe_typed` / `subscribe_dynamic` 的回调不带 timestamp/source；需要时间信息时走 raw `subscribe` 的 `DataCallback`。
+- 如果发布端用原始 `publish()` 且没有注册 schema，数据就只是字节；自描述的前提是发布端注册了 schema。
+
+#### 快照语义
+
+`Node::request_snapshot(TypeId)` 向所有在线 peer 请求该类型下**当前保存的最新 full 状态**：
+
+- 不是 per-object 请求，也不是历史事件回放；
+- publisher 的 `ObjectStateStore` 有上限，被驱逐的对象不会出现在快照里；
+- 单对象超过 chunk 上限会被跳过；staging 超时/缺块/超限会整份丢弃；
+- 接收端按 `Begin / Chunk / End` 原子应用，和实时数据按 timestamp/sequence 去重；
+- 快照**不是自动触发的**，晚加入的订阅者需要应用自己调用 `request_snapshot()`。
+
+#### 投递语义
+
+- 数据面是 **UDP 单播**，每个在线 peer 发一次；没有 TCP/ACK/数据重传。
+- `publish()` 返回 `true` 只代表 `sendto` 成功，不代表对端一定收到。
+- 晚启动的订阅者会错过之前的实时帧，只能靠快照补“最新状态”。
+- delta 没有 baseline 时会被丢弃（`rx_delta_no_base`）；快照/full publish 用于恢复基线。
+- 控制面的 schema/snapshot 请求有重试；数据面没有。
+
+#### 当前尚未实现 / 后续方向
+
+- 通配订阅、按类型名订阅、新类型到达事件；
+- 独立事件流：event_id / 事件历史 / 回放 / exactly-once；
+- 严格时钟同步与事件时间（watermark）语义；
+- 数据面可靠传输（重传/ACK）；
+- 共享内存（SHM）与 60 万+ 数据点的正式验证（README 顶部部分能力属于目标/路线图）。
+
 ### 日志
 
 库内部使用项目自带的 `Logger` 组件（spdlog + nlohmann/json）。未初始化时日志静默，应用启动时初始化一次即可：
