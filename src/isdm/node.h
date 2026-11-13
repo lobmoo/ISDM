@@ -10,6 +10,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -17,6 +18,7 @@
 
 #include "isdm/codec/codec.h"
 #include "isdm/codec/object_codec.h"
+#include "isdm/core/command.h"
 #include "isdm/core/data_view.h"
 #include "isdm/core/event.h"
 #include "isdm/core/types.h"
@@ -87,6 +89,13 @@ struct NodeConfig {
     std::chrono::milliseconds event_history_age{300000};
     // watermark = 已观察最大 source timestamp - lateness。
     std::chrono::milliseconds event_watermark_lateness{100};
+
+    // Command/ACK：发送端重试与接收端去重缓存。
+    std::chrono::milliseconds command_retry_interval{200};
+    int command_max_attempts = 3;
+    std::chrono::milliseconds command_default_timeout{500};
+    std::size_t max_command_results = 1024U;
+    std::chrono::milliseconds command_result_age{30000};
 };
 
 // Application-facing node: composes discovery, schema registry, and the
@@ -106,6 +115,10 @@ public:
     using DynamicEventCallback =
         std::function<void(const EventMetadata&, const DynamicObject&)>;
     using EventWatermarkCallback = std::function<void(TypeId, Timestamp)>;
+    using CommandHandler = std::function<CommandResponse(const CommandMetadata&, DataView)>;
+    using DynamicCommandHandler =
+        std::function<CommandResponse(const CommandMetadata&, const DynamicObject&)>;
+    using CommandResultCallback = std::function<void(const CommandResult&)>;
 
     explicit Node(NodeConfig config);
     ~Node();
@@ -370,6 +383,83 @@ public:
     void set_event_watermark_callback(EventWatermarkCallback cb);
     std::size_t event_history_size() const;
 
+    // ── Command / ACK API ──────────────────────────────────────────────────
+    void subscribe_command(CommandId command_id, CommandHandler handler);
+
+    template <typename T>
+    void subscribe_command_typed(
+        CommandId command_id, TypeId type_id,
+        std::function<CommandResponse(const CommandMetadata&, const T&)> handler) {
+        auto type = typed_type<T>(type_id);
+        subscribe_command(
+            command_id,
+            [this, type, type_id, handler = std::move(handler)](
+                const CommandMetadata& metadata, DataView payload) -> CommandResponse {
+                if (!handler) return {CommandStatus::kRejected, "no handler"};
+                if (metadata.type_id != 0 && metadata.type_id != type_id) {
+                    return {CommandStatus::kRejected, "type mismatch"};
+                }
+                IncomingObject incoming{metadata.object_id, metadata.type_id,
+                                        metadata.schema_id, payload,
+                                        metadata.source_timestamp, metadata.source};
+                if (!typed_schema_ok(*type, incoming)) {
+                    return {CommandStatus::kRejected, "schema mismatch"};
+                }
+                T value{};
+                ByteReader reader(payload);
+                if (!ObjectCodec::decode(*type, reader, &value)) {
+                    log_decode_failure("subscribe_command_typed", metadata.object_id,
+                                       metadata.type_id, metadata.schema_id);
+                    metrics_.rx_decode_errors++;
+                    return {CommandStatus::kError, "decode failed"};
+                }
+                return handler(metadata, value);
+            });
+    }
+
+    void subscribe_command_dynamic(CommandId command_id, DynamicCommandHandler handler);
+    void set_command_result_callback(CommandResultCallback cb);
+
+    bool send_command(NodeId target_node_id, CommandId command_id, TypeId type_id,
+                      ObjectId object_id, DataView payload, Timestamp source_ts = 0,
+                      std::chrono::milliseconds timeout = std::chrono::milliseconds(0));
+    bool send_command(NodeId target_node_id, CommandId command_id, TypeId type_id,
+                      ObjectId object_id, DataView payload, Timestamp source_ts,
+                      SchemaId schema_id, std::chrono::milliseconds timeout);
+
+    template <typename T>
+    bool send_command_typed(NodeId target_node_id, CommandId command_id, TypeId type_id,
+                            ObjectId object_id, const T& value, Timestamp source_ts = 0,
+                            std::chrono::milliseconds timeout = std::chrono::milliseconds(0)) {
+        std::shared_ptr<ReflectedType> type;
+        {
+            std::shared_lock<std::shared_mutex> lock(typed_mutex_);
+            const auto it = typed_types_.find(type_id);
+            if (it == typed_types_.end()) {
+                log_command_failure("send_command_typed", command_id, object_id,
+                                    "type is not registered locally");
+                return false;
+            }
+            type = it->second;
+        }
+        std::byte payload_storage[kMaxFrame];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!ObjectCodec::encode(*type, &value, writer)) {
+            log_command_failure("send_command_typed", command_id, object_id,
+                                "encode failed");
+            metrics_.tx_encode_errors++;
+            return false;
+        }
+        return send_command_encoded(target_node_id, command_id, type_id, object_id,
+                                    DataView(payload_storage, writer.offset()), source_ts,
+                                    schema_fingerprint(type->descriptor()), timeout);
+    }
+
+    bool send_command_dynamic(NodeId target_node_id, CommandId command_id, TypeId type_id,
+                              ObjectId object_id, const DynamicObject& object,
+                              Timestamp source_ts = 0,
+                              std::chrono::milliseconds timeout = std::chrono::milliseconds(0));
+
     // Delta subscription: the callback always receives the FULL current value.
     // The first full object seeds the cache; subsequent deltas patch it.
     void subscribe_delta(TypeId type_id, DataCallback cb);
@@ -444,6 +534,25 @@ private:
         int attempts = 0;
     };
 
+    struct CachedCommandResult {
+        CommandStatus status = CommandStatus::kOk;
+        std::string message;
+        Timestamp created = 0;
+    };
+
+    struct PendingCommand {
+        std::uint32_t request_id = 0;
+        CommandId command_id = 0;
+        ObjectId object_id = 0;
+        transport::Endpoint target;
+        std::vector<std::byte> frame;
+        std::chrono::steady_clock::time_point next_retry;
+        std::chrono::steady_clock::time_point deadline;
+        int attempts = 1;
+        int max_attempts = 3;
+        std::chrono::milliseconds retry_interval{200};
+    };
+
     static constexpr std::size_t kMaxFrame = 65536;
 
     static Timestamp now_ns() noexcept {
@@ -505,6 +614,20 @@ private:
     void maybe_advance_event_watermarks();
     void log_event_publish_failure(const char* operation, EventId event_id, TypeId type_id,
                                    const char* reason);
+
+    bool send_command_encoded(NodeId target_node_id, CommandId command_id, TypeId type_id,
+                              ObjectId object_id, DataView payload, Timestamp source_ts,
+                              SchemaId schema_id, std::chrono::milliseconds timeout);
+    bool find_peer_endpoint(NodeId node_id, transport::Endpoint& out) const;
+    void handle_command_payload(DataView payload, SchemaId schema_id,
+                                const transport::Endpoint& source);
+    void handle_command_ack(DataView payload);
+    void send_command_ack(const CommandMetadata& metadata, CommandStatus status,
+                          std::string_view message, const transport::Endpoint& dest);
+    void retry_pending_commands(std::chrono::steady_clock::time_point now);
+    void prune_command_results_locked(Timestamp now);
+    void log_command_failure(const char* operation, CommandId command_id,
+                             ObjectId object_id, const char* reason);
     void log_publish_failure(const char* operation, ObjectId object_id, TypeId type_id,
                              const char* reason);
     void log_registration_failure(TypeId type_id, Version version, const char* reason);
@@ -620,6 +743,12 @@ private:
     std::unordered_map<TypeId, Timestamp> event_max_source_ts_;
     std::unordered_map<TypeId, Timestamp> event_watermarks_;
     std::chrono::steady_clock::time_point last_event_watermark_check_;
+    std::unordered_map<CommandId, CommandHandler> command_handlers_;
+    CommandResultCallback command_result_callback_;
+    std::mutex command_mutex_;
+    std::unordered_map<std::uint32_t, PendingCommand> pending_commands_;
+    std::map<std::pair<std::uint64_t, std::uint32_t>, CachedCommandResult>
+        command_results_;
     std::unordered_set<NodeId> known_peers_;
     std::array<std::byte, kMaxFrame> recv_{};
     PeerStateCallback peer_state_callback_;

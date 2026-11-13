@@ -379,6 +379,36 @@ subscriber.set_event_watermark_callback(
 # 期望：replayed=3 live=1，并打印 watermark
 ```
 
+### 6.8 命令与 ACK
+
+Command 是定向控制，目标节点处理完后返回 ACK/NACK：
+
+```cpp
+// 目标端：按 CommandId 注册 handler，返回 CommandResponse
+target.subscribe_command_typed<Motor>(920, 100,
+    [](const isdm::CommandMetadata& meta, const Motor& value) {
+        return isdm::CommandResponse{isdm::CommandStatus::kOk, "applied"};
+    });
+
+// 发送端：结果回调收到 kOk / kRejected / kError / kTimeout
+commander.set_command_result_callback([](const isdm::CommandResult& result) {
+    std::printf("command=%u status=%s message=%s\n", result.command_id,
+                isdm::command_status_name(result.status), result.message.c_str());
+});
+
+commander.send_command_typed(target_node_id, 920, 100, object_id, motor, source_ts,
+                             std::chrono::milliseconds(500));
+```
+
+发送端会自动重试，接收端按 `(source, request_id)` 抑制重复执行。handler 在目标数据线程执行，长耗时逻辑应自行转交工作线程。
+
+运行示例：
+
+```bash
+./build/examples/isdm_demo_commands
+# 期望：results=3，ok / rejected(blocked) / rejected(no handler)
+```
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。

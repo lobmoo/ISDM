@@ -47,6 +47,13 @@ public:
     std::atomic<std::uint64_t> rx_events{0};
     std::atomic<std::uint64_t> rx_event_duplicates{0};
     std::atomic<std::uint64_t> rx_event_replays{0};
+    std::atomic<std::uint64_t> tx_commands{0};
+    std::atomic<std::uint64_t> rx_commands{0};
+    std::atomic<std::uint64_t> tx_command_retries{0};
+    std::atomic<std::uint64_t> tx_command_acks{0};
+    std::atomic<std::uint64_t> rx_command_acks{0};
+    std::atomic<std::uint64_t> rx_command_duplicates{0};
+    std::atomic<std::uint64_t> command_timeouts{0};
 
     struct Snapshot {
         std::uint64_t tx_frames;
@@ -86,6 +93,13 @@ public:
         std::uint64_t rx_events;
         std::uint64_t rx_event_duplicates;
         std::uint64_t rx_event_replays;
+        std::uint64_t tx_commands;
+        std::uint64_t rx_commands;
+        std::uint64_t tx_command_retries;
+        std::uint64_t tx_command_acks;
+        std::uint64_t rx_command_acks;
+        std::uint64_t rx_command_duplicates;
+        std::uint64_t command_timeouts;
     };
 
     Snapshot snapshot() const noexcept;
@@ -129,7 +143,14 @@ inline Metrics::Snapshot Metrics::snapshot() const noexcept {
                     tx_events.load(std::memory_order_relaxed),
                     rx_events.load(std::memory_order_relaxed),
                     rx_event_duplicates.load(std::memory_order_relaxed),
-                    rx_event_replays.load(std::memory_order_relaxed)};
+                    rx_event_replays.load(std::memory_order_relaxed),
+                    tx_commands.load(std::memory_order_relaxed),
+                    rx_commands.load(std::memory_order_relaxed),
+                    tx_command_retries.load(std::memory_order_relaxed),
+                    tx_command_acks.load(std::memory_order_relaxed),
+                    rx_command_acks.load(std::memory_order_relaxed),
+                    rx_command_duplicates.load(std::memory_order_relaxed),
+                    command_timeouts.load(std::memory_order_relaxed)};
 }
 
 inline void Metrics::reset() noexcept {
@@ -170,6 +191,13 @@ inline void Metrics::reset() noexcept {
     rx_events = 0;
     rx_event_duplicates = 0;
     rx_event_replays = 0;
+    tx_commands = 0;
+    rx_commands = 0;
+    tx_command_retries = 0;
+    tx_command_acks = 0;
+    rx_command_acks = 0;
+    rx_command_duplicates = 0;
+    command_timeouts = 0;
 }
 
 }  // namespace isdm

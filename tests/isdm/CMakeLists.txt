@@ -175,6 +175,16 @@ target_link_libraries(isdm_test_node_events PRIVATE ISDM::core GTest::gtest_main
 target_compile_features(isdm_test_node_events PRIVATE cxx_std_17)
 target_compile_options(isdm_test_node_events PRIVATE -Wall -Wextra -Wpedantic)
 
+add_executable(isdm_test_command_wire test_command_wire.cc)
+target_link_libraries(isdm_test_command_wire PRIVATE ISDM::core GTest::gtest_main)
+target_compile_features(isdm_test_command_wire PRIVATE cxx_std_17)
+target_compile_options(isdm_test_command_wire PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(isdm_test_node_commands test_node_commands.cc)
+target_link_libraries(isdm_test_node_commands PRIVATE ISDM::core GTest::gtest_main)
+target_compile_features(isdm_test_node_commands PRIVATE cxx_std_17)
+target_compile_options(isdm_test_node_commands PRIVATE -Wall -Wextra -Wpedantic)
+
 include(GoogleTest)
 gtest_discover_tests(isdm_test_types)
 gtest_discover_tests(isdm_test_arena_allocator)
@@ -211,3 +221,5 @@ gtest_discover_tests(isdm_test_type_discovery)
 gtest_discover_tests(isdm_test_event_wire)
 gtest_discover_tests(isdm_test_event_store)
 gtest_discover_tests(isdm_test_node_events)
+gtest_discover_tests(isdm_test_command_wire)
+gtest_discover_tests(isdm_test_node_commands)

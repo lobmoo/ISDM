@@ -7,6 +7,7 @@
 #include "isdm/discovery/discovery_manager.h"
 #include "isdm/logging.h"
 #include "isdm/protocol/batch_data_message.h"
+#include "isdm/protocol/command.h"
 #include "isdm/protocol/data_message.h"
 #include "isdm/protocol/event.h"
 #include "isdm/transport/udp_transport.h"
@@ -772,6 +773,400 @@ bool Node::send_event_record(const EventRecord& record,
     return send_to_peer(DataView(frame_storage, frame_writer.offset()), dest);
 }
 
+void Node::log_command_failure(const char* operation, CommandId command_id,
+                               ObjectId object_id, const char* reason) {
+    ISDM_LOG_TIME(warning, 1000)
+        << "[command] " << operation << " failed: " << reason
+        << " command_id=" << command_id << " object_id=" << object_id;
+}
+
+void Node::subscribe_command(CommandId command_id, CommandHandler handler) {
+    if (!handler) return;
+    ISDM_LOG(debug) << "[command] subscribe command_id=" << command_id;
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    command_handlers_[command_id] = std::move(handler);
+}
+
+void Node::subscribe_command_dynamic(CommandId command_id,
+                                     DynamicCommandHandler handler) {
+    if (!handler) return;
+    subscribe_command(command_id, [this, handler = std::move(handler)](
+                                      const CommandMetadata& metadata,
+                                      DataView payload) -> CommandResponse {
+        IncomingObject incoming{metadata.object_id, metadata.type_id, metadata.schema_id,
+                                payload, metadata.source_timestamp, metadata.source};
+        DynamicObject object;
+        if (!decode_dynamic_object(incoming, object)) {
+            return {CommandStatus::kRejected, "schema unavailable or decode failed"};
+        }
+        return handler(metadata, object);
+    });
+}
+
+void Node::set_command_result_callback(CommandResultCallback cb) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    command_result_callback_ = std::move(cb);
+}
+
+bool Node::send_command(NodeId target_node_id, CommandId command_id, TypeId type_id,
+                        ObjectId object_id, DataView payload, Timestamp source_ts,
+                        std::chrono::milliseconds timeout) {
+    return send_command_encoded(target_node_id, command_id, type_id, object_id, payload,
+                                source_ts, 0U, timeout);
+}
+
+bool Node::send_command(NodeId target_node_id, CommandId command_id, TypeId type_id,
+                        ObjectId object_id, DataView payload, Timestamp source_ts,
+                        SchemaId schema_id, std::chrono::milliseconds timeout) {
+    return send_command_encoded(target_node_id, command_id, type_id, object_id, payload,
+                                source_ts, schema_id, timeout);
+}
+
+bool Node::send_command_dynamic(NodeId target_node_id, CommandId command_id,
+                                TypeId type_id, ObjectId object_id,
+                                const DynamicObject& object, Timestamp source_ts,
+                                std::chrono::milliseconds timeout) {
+    const TypeDescriptor* descriptor = registry_.find(type_id);
+    if (descriptor == nullptr) {
+        log_command_failure("send_command_dynamic", command_id, object_id,
+                            "unknown type");
+        return false;
+    }
+    std::byte payload_storage[kMaxFrame];
+    ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+    if (!ObjectCodec::encode_dynamic(*descriptor, object, writer)) {
+        log_command_failure("send_command_dynamic", command_id, object_id,
+                            "encode failed");
+        metrics_.tx_encode_errors++;
+        return false;
+    }
+    return send_command_encoded(target_node_id, command_id, type_id, object_id,
+                                DataView(payload_storage, writer.offset()), source_ts,
+                                schema_fingerprint(*descriptor), timeout);
+}
+
+bool Node::find_peer_endpoint(NodeId node_id, transport::Endpoint& out) const {
+    if (discovery_ == nullptr) return false;
+    bool found = false;
+    discovery_->peers().for_each([&](const PeerInfo& peer) {
+        if (!found && peer.online && peer.node_id == node_id) {
+            out = peer.endpoint;
+            found = true;
+        }
+    });
+    return found;
+}
+
+bool Node::send_command_encoded(NodeId target_node_id, CommandId command_id,
+                                TypeId type_id, ObjectId object_id, DataView payload,
+                                Timestamp source_ts, SchemaId schema_id,
+                                std::chrono::milliseconds timeout) {
+    if (!started_) {
+        log_command_failure("send_command", command_id, object_id, "node not started");
+        return false;
+    }
+    transport::Endpoint target;
+    if (!find_peer_endpoint(target_node_id, target)) {
+        log_command_failure("send_command", command_id, object_id,
+                            "target peer is not online");
+        return false;
+    }
+    if (payload.size() > 0xFFFFFFFFULL) {
+        log_command_failure("send_command", command_id, object_id, "payload too large");
+        return false;
+    }
+
+    const Timestamp resolved_ts = source_ts == 0 ? now_ns() : source_ts;
+    const std::uint32_t request_id =
+        next_request_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+    protocol::CommandMessage message;
+    message.command_id = command_id;
+    message.request_id = request_id;
+    message.object_id = object_id;
+    message.type_id = type_id;
+    message.source_timestamp = resolved_ts;
+    message.payload = payload;
+
+    std::byte payload_storage[kMaxFrame];
+    ByteWriter payload_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+    if (!protocol::encode_command(message, payload_writer)) {
+        log_command_failure("send_command", command_id, object_id, "encode failed");
+        return false;
+    }
+    protocol::Header header;
+    header.message_type = protocol::MessageType::kCommand;
+    header.sequence = next_sequence();
+    header.schema_id = schema_id;
+    std::byte frame_storage[kMaxFrame];
+    ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+    if (!protocol::encode_frame(header, payload_storage, payload_writer.offset(),
+                                frame_writer)) {
+        log_command_failure("send_command", command_id, object_id,
+                            "frame encode failed");
+        return false;
+    }
+    if (send_to_peer(DataView(frame_storage, frame_writer.offset()), target) == 0) {
+        log_command_failure("send_command", command_id, object_id, "send failed");
+        return false;
+    }
+
+    if (timeout.count() <= 0) timeout = config_.command_default_timeout;
+    const auto now = std::chrono::steady_clock::now();
+    PendingCommand pending;
+    pending.request_id = request_id;
+    pending.command_id = command_id;
+    pending.object_id = object_id;
+    pending.target = target;
+    pending.frame.assign(frame_storage, frame_storage + frame_writer.offset());
+    pending.next_retry = now + config_.command_retry_interval;
+    pending.deadline = now + timeout;
+    pending.attempts = 1;
+    pending.max_attempts = std::max(1, config_.command_max_attempts);
+    pending.retry_interval = config_.command_retry_interval;
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        pending_commands_[request_id] = std::move(pending);
+    }
+    metrics_.tx_commands++;
+    ISDM_LOG(info) << "[command] sent request_id=" << request_id
+                   << " command_id=" << command_id << " object_id=" << object_id
+                   << " type_id=" << type_id << " target_node=" << target_node_id
+                   << " target=" << target.to_string()
+                   << " timeout_ms=" << timeout.count();
+    return true;
+}
+
+void Node::send_command_ack(const CommandMetadata& metadata, CommandStatus status,
+                            std::string_view message,
+                            const transport::Endpoint& dest) {
+    if (status == CommandStatus::kTimeout) status = CommandStatus::kError;
+    protocol::CommandAckMessage ack;
+    ack.request_id = metadata.request_id;
+    ack.command_id = metadata.command_id;
+    ack.status = status;
+    ack.message = DataView(message.data(), message.size());
+
+    std::byte payload_storage[512];
+    ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+    if (!protocol::encode_command_ack(ack, writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[command] ack encode failed request_id=" << metadata.request_id
+            << " command_id=" << metadata.command_id;
+        return;
+    }
+    protocol::Header header;
+    header.message_type = protocol::MessageType::kCommandAck;
+    std::byte frame_storage[1024];
+    ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+    if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[command] ack frame encode failed request_id=" << metadata.request_id;
+        return;
+    }
+    if (send_to_peer(DataView(frame_storage, frame_writer.offset()), dest) != 0) {
+        metrics_.tx_command_acks++;
+    }
+}
+
+void Node::prune_command_results_locked(Timestamp now) {
+    for (auto it = command_results_.begin(); it != command_results_.end();) {
+        if (it->second.created != 0 && now > it->second.created &&
+            now - it->second.created >
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    config_.command_result_age)
+                    .count()) {
+            it = command_results_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    while (config_.max_command_results != 0 &&
+           command_results_.size() > config_.max_command_results) {
+        auto oldest = command_results_.end();
+        for (auto it = command_results_.begin(); it != command_results_.end(); ++it) {
+            if (oldest == command_results_.end() ||
+                it->second.created < oldest->second.created) {
+                oldest = it;
+            }
+        }
+        if (oldest == command_results_.end()) break;
+        command_results_.erase(oldest);
+    }
+}
+
+void Node::handle_command_payload(DataView payload, SchemaId schema_id,
+                                  const transport::Endpoint& source) {
+    protocol::CommandMessage message;
+    if (!protocol::decode_command(payload, message)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[command] malformed command from " << source.to_string()
+            << " bytes=" << payload.size();
+        return;
+    }
+    CommandMetadata metadata;
+    metadata.command_id = message.command_id;
+    metadata.request_id = message.request_id;
+    metadata.object_id = message.object_id;
+    metadata.type_id = message.type_id;
+    metadata.schema_id = schema_id;
+    metadata.source_timestamp = message.source_timestamp;
+    metadata.receive_timestamp = now_ns();
+    metadata.source = source;
+
+    const std::uint64_t source_raw = source.to_raw();
+    const Timestamp now = metadata.receive_timestamp;
+    CommandResponse response;
+    bool cached_hit = false;
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        const auto cached = command_results_.find({source_raw, metadata.request_id});
+        if (cached != command_results_.end()) {
+            response.status = cached->second.status;
+            response.message = cached->second.message;
+            cached_hit = true;
+            metrics_.rx_command_duplicates++;
+        }
+    }
+
+    if (!cached_hit) {
+        CommandHandler handler;
+        {
+            std::lock_guard<std::mutex> callback_lock(callback_mutex_);
+            const auto it = command_handlers_.find(metadata.command_id);
+            if (it != command_handlers_.end()) handler = it->second;
+        }
+        if (!handler) {
+            response = {CommandStatus::kRejected, "no handler"};
+        } else {
+            try {
+                response = handler(metadata, message.payload);
+            } catch (const std::exception& error) {
+                response = {CommandStatus::kError, error.what()};
+            } catch (...) {
+                response = {CommandStatus::kError, "handler exception"};
+            }
+        }
+        if (response.status == CommandStatus::kTimeout) {
+            response.status = CommandStatus::kError;
+        }
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        command_results_[{source_raw, metadata.request_id}] =
+            CachedCommandResult{response.status, response.message, now};
+        prune_command_results_locked(now);
+    }
+
+    metrics_.rx_commands++;
+    ISDM_LOG(info) << "[command] received request_id=" << metadata.request_id
+                   << " command_id=" << metadata.command_id
+                   << " object_id=" << metadata.object_id
+                   << " type_id=" << metadata.type_id
+                   << " status=" << command_status_name(response.status)
+                   << " from " << source.to_string();
+    send_command_ack(metadata, response.status, response.message, source);
+}
+
+void Node::handle_command_ack(DataView payload) {
+    protocol::CommandAckMessage ack;
+    if (!protocol::decode_command_ack(payload, ack)) {
+        ISDM_LOG_TIME(warning, 1000) << "[command] malformed ack, bytes="
+                                     << payload.size();
+        return;
+    }
+    metrics_.rx_command_acks++;
+
+    PendingCommand pending;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        const auto it = pending_commands_.find(ack.request_id);
+        if (it != pending_commands_.end()) {
+            if (it->second.command_id != ack.command_id) {
+                ISDM_LOG_TIME(warning, 1000)
+                    << "[command] ack command_id mismatch request_id="
+                    << ack.request_id << " expected=" << it->second.command_id
+                    << " got=" << ack.command_id;
+                return;
+            }
+            pending = std::move(it->second);
+            pending_commands_.erase(it);
+            found = true;
+        }
+    }
+    if (!found) {
+        ISDM_LOG(debug) << "[command] ack for unknown/expired request_id="
+                        << ack.request_id;
+        return;
+    }
+
+    CommandResult result;
+    result.request_id = pending.request_id;
+    result.command_id = pending.command_id;
+    result.object_id = pending.object_id;
+    result.status = ack.status;
+    result.message.assign(reinterpret_cast<const char*>(ack.message.data()),
+                          ack.message.size());
+    ISDM_LOG(info) << "[command] ack request_id=" << result.request_id
+                   << " command_id=" << result.command_id
+                   << " object_id=" << result.object_id
+                   << " status=" << command_status_name(result.status)
+                   << " message=" << result.message;
+    CommandResultCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        cb = command_result_callback_;
+    }
+    if (cb) cb(result);
+}
+
+void Node::retry_pending_commands(std::chrono::steady_clock::time_point now) {
+    std::vector<std::pair<transport::Endpoint, std::vector<std::byte>>> resends;
+    std::vector<CommandResult> timeouts;
+    {
+        std::lock_guard<std::mutex> lock(command_mutex_);
+        for (auto it = pending_commands_.begin(); it != pending_commands_.end();) {
+            PendingCommand& pending = it->second;
+            if (now >= pending.deadline) {
+                CommandResult result;
+                result.request_id = pending.request_id;
+                result.command_id = pending.command_id;
+                result.object_id = pending.object_id;
+                result.status = CommandStatus::kTimeout;
+                result.message = "timeout";
+                timeouts.push_back(std::move(result));
+                pending_commands_.erase(it++);
+                continue;
+            }
+            if (now >= pending.next_retry &&
+                pending.attempts < pending.max_attempts) {
+                pending.attempts++;
+                pending.next_retry = now + pending.retry_interval;
+                resends.emplace_back(pending.target, pending.frame);
+            }
+            ++it;
+        }
+    }
+    for (auto& [target, frame] : resends) {
+        metrics_.tx_command_retries++;
+        if (send_to_peer(DataView(frame.data(), frame.size()), target) == 0) {
+            ISDM_LOG_TIME(warning, 1000)
+                << "[command] retry send failed target=" << target.to_string();
+        }
+    }
+    if (timeouts.empty()) return;
+    CommandResultCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        cb = command_result_callback_;
+    }
+    for (const CommandResult& result : timeouts) {
+        metrics_.command_timeouts++;
+        ISDM_LOG(warning) << "[command] timeout request_id=" << result.request_id
+                          << " command_id=" << result.command_id
+                          << " object_id=" << result.object_id;
+        if (cb) cb(result);
+    }
+}
+
 void Node::subscribe_delta(TypeId type_id, DataCallback cb) {
     ISDM_LOG(debug) << "[node] subscribe delta type_id=" << type_id;
     delta_enabled_.store(true, std::memory_order_release);
@@ -989,6 +1384,10 @@ void Node::dispatch_frame(DataView frame_bytes, const transport::Endpoint& sourc
     } else if (frame.header.message_type ==
                protocol::MessageType::kEventReplayRequest) {
         handle_event_replay_request(frame.payload, source);
+    } else if (frame.header.message_type == protocol::MessageType::kCommand) {
+        handle_command_payload(frame.payload, frame.header.schema_id, source);
+    } else if (frame.header.message_type == protocol::MessageType::kCommandAck) {
+        handle_command_ack(frame.payload);
     } else {
         ISDM_LOG_TIME(warning, 1000)
             << "[protocol] unknown message_type="
@@ -1274,6 +1673,7 @@ void Node::pump_once() {
         for (int i = 0; i < 4; ++i) discovery_->poll_once();
     }
     drain_data();
+    retry_pending_commands(std::chrono::steady_clock::now());
     maybe_advance_event_watermarks();
 }
 
@@ -1296,6 +1696,7 @@ void Node::control_loop() {
         const auto retry_now = std::chrono::steady_clock::now();
         if (retry_now - last_retry >= std::chrono::milliseconds(50)) {
             retry_pending_requests(retry_now);
+            retry_pending_commands(retry_now);
             last_retry = retry_now;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

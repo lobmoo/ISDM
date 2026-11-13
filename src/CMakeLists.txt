@@ -8,6 +8,7 @@ add_library(isdm_core STATIC
     isdm/log/logger_impl.cc
     isdm/node.cc
     isdm/protocol/batch_data_message.cc
+    isdm/protocol/command.cc
     isdm/protocol/crc32c.cc
     isdm/protocol/data_message.cc
     isdm/protocol/delta.cc
