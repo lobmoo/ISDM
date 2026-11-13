@@ -343,6 +343,42 @@ const isdm::TypeId id = subscriber.find_type_id_by_name("Motor");
 # 期望：discovered_types=2 all_objects=2 by_name_temperature=1
 ```
 
+### 6.7 事件与时间语义
+
+事件和对象状态是两套语义：对象只保留最新值，事件进入有界历史，可 replay。
+
+```cpp
+// 发布事件
+publisher.publish_event_typed(1001, kAlarmTypeId, isdm::EventSeverity::kWarning,
+                              alarm, source_timestamp);
+
+// 动态订阅（不需要业务结构体）
+subscriber.subscribe_event_dynamic(
+    kAlarmTypeId, [](const isdm::EventMetadata& meta, const isdm::DynamicObject& obj) {
+        std::printf("event=%llu severity=%s source_ts=%lld replay=%d\n",
+                    static_cast<unsigned long long>(meta.event_id),
+                    isdm::event_severity_name(meta.severity),
+                    static_cast<long long>(meta.source_timestamp),
+                    meta.replay ? 1 : 0);
+    });
+
+// 晚加入：拉取历史事件
+subscriber.request_event_replay(kAlarmTypeId, /*since=*/0, /*max_events=*/1000);
+
+// watermark = 已观察最大 source timestamp - lateness
+subscriber.set_event_watermark_callback(
+    [](isdm::TypeId type_id, isdm::Timestamp watermark) { /* ... */ });
+```
+
+`EventMetadata` 同时提供 `source_timestamp` 与 `receive_timestamp`；`(source, event_id)` 是去重键。replay 仍走 UDP best-effort，没有 ACK/exactly-once。
+
+运行示例：
+
+```bash
+./build/examples/isdm_demo_events
+# 期望：replayed=3 live=1，并打印 watermark
+```
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。

@@ -8,6 +8,7 @@
 #include "isdm/logging.h"
 #include "isdm/protocol/batch_data_message.h"
 #include "isdm/protocol/data_message.h"
+#include "isdm/protocol/event.h"
 #include "isdm/transport/udp_transport.h"
 
 namespace isdm {
@@ -36,6 +37,12 @@ const PeerTable& Node::peers() const noexcept {
 
 Node::Node(NodeConfig config) : config_(std::move(config)) {
     state_store_.set_limits(config_.max_state_objects, config_.max_state_bytes);
+    EventStore::Config event_config;
+    event_config.max_events = config_.max_event_history;
+    event_config.max_bytes = config_.max_event_history_bytes;
+    event_config.max_age = config_.event_history_age;
+    event_history_.set_config(event_config);
+    last_event_watermark_check_ = std::chrono::steady_clock::now();
 }
 
 Node::~Node() { stop(); }
@@ -398,6 +405,373 @@ void Node::resolve_name_subscriptions(const TypeDescriptor& descriptor) {
     }
 }
 
+void Node::log_event_publish_failure(const char* operation, EventId event_id,
+                                     TypeId type_id, const char* reason) {
+    ISDM_LOG_TIME(warning, 1000)
+        << "[event] " << operation << " rejected: " << reason << " type_id=" << type_id
+        << " event_id=" << event_id;
+}
+
+bool Node::publish_event(EventId event_id, TypeId type_id, EventSeverity severity,
+                         DataView payload, Timestamp source_ts) {
+    return publish_event_encoded(event_id, type_id, severity, payload, source_ts, 0U);
+}
+
+bool Node::publish_event(EventId event_id, TypeId type_id, EventSeverity severity,
+                         DataView payload, Timestamp source_ts, SchemaId schema_id) {
+    return publish_event_encoded(event_id, type_id, severity, payload, source_ts,
+                                 schema_id);
+}
+
+bool Node::publish_event_dynamic(EventId event_id, TypeId type_id,
+                                 EventSeverity severity, const DynamicObject& object,
+                                 Timestamp source_ts) {
+    const TypeDescriptor* descriptor = registry_.find(type_id);
+    if (descriptor == nullptr) {
+        log_event_publish_failure("publish_event_dynamic", event_id, type_id,
+                                  "unknown type");
+        return false;
+    }
+    std::byte payload_storage[kMaxFrame];
+    ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+    if (!ObjectCodec::encode_dynamic(*descriptor, object, writer)) {
+        log_event_publish_failure("publish_event_dynamic", event_id, type_id,
+                                  "encode failed");
+        metrics_.tx_encode_errors++;
+        return false;
+    }
+    return publish_event_encoded(event_id, type_id, severity,
+                                 DataView(payload_storage, writer.offset()), source_ts,
+                                 schema_fingerprint(*descriptor));
+}
+
+bool Node::publish_event_encoded(EventId event_id, TypeId type_id,
+                                 EventSeverity severity, DataView payload,
+                                 Timestamp source_ts, SchemaId schema_id) {
+    if (!started_) {
+        log_event_publish_failure("publish_event", event_id, type_id,
+                                  "node not started");
+        return false;
+    }
+    if (payload.size() > 0xFFFFFFFFULL) {
+        log_event_publish_failure("publish_event", event_id, type_id,
+                                  "payload too large");
+        return false;
+    }
+    const Timestamp resolved_ts = source_ts == 0 ? now_ns() : source_ts;
+    protocol::EventMessage message;
+    message.event_id = event_id;
+    message.type_id = type_id;
+    message.severity = severity;
+    message.source_timestamp = resolved_ts;
+    message.payload = payload;
+
+    std::byte payload_storage[kMaxFrame];
+    ByteWriter payload_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+    if (!protocol::encode_event(message, payload_writer)) {
+        log_event_publish_failure("publish_event", event_id, type_id,
+                                  "event encode failed");
+        return false;
+    }
+
+    protocol::Header header;
+    header.message_type = protocol::MessageType::kEvent;
+    header.sequence = next_sequence();
+    header.schema_id = schema_id;
+    std::byte frame_storage[kMaxFrame];
+    ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+    if (!protocol::encode_frame(header, payload_storage, payload_writer.offset(),
+                                frame_writer)) {
+        log_event_publish_failure("publish_event", event_id, type_id,
+                                  "frame encode failed");
+        return false;
+    }
+
+    EventRecord record;
+    record.metadata.event_id = event_id;
+    record.metadata.type_id = type_id;
+    record.metadata.schema_id = schema_id;
+    record.metadata.severity = severity;
+    record.metadata.source_timestamp = resolved_ts;
+    record.metadata.receive_timestamp = now_ns();
+    record.metadata.sequence = header.sequence;
+    record.metadata.source = data_->local_endpoint();
+    if (payload.size() != 0) {
+        record.payload.assign(payload.data(), payload.data() + payload.size());
+    }
+    const EventStore::AppendResult stored = event_history_.append(std::move(record));
+    if (stored != EventStore::AppendResult::kStored) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[event] local history rejected event_id=" << event_id
+            << " type_id=" << type_id
+            << " reason=" << (stored == EventStore::AppendResult::kDuplicate
+                                  ? "duplicate"
+                                  : "limit");
+    }
+
+    metrics_.tx_events++;
+    ISDM_LOG(debug) << "[event] publish event_id=" << event_id << " type_id=" << type_id
+                    << " severity=" << event_severity_name(severity)
+                    << " source_ts=" << resolved_ts << " bytes=" << payload.size();
+    return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
+}
+
+void Node::subscribe_event(TypeId type_id, EventCallback cb) {
+    if (!cb) return;
+    ISDM_LOG(debug) << "[event] subscribe type_id=" << type_id;
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    by_event_type_.emplace_back(type_id, std::move(cb));
+}
+
+void Node::subscribe_all_events(EventCallback cb) {
+    if (!cb) return;
+    ISDM_LOG(debug) << "[event] subscribe all";
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    event_all_.push_back(std::move(cb));
+}
+
+void Node::subscribe_event_dynamic(TypeId type_id, DynamicEventCallback cb) {
+    if (!cb) return;
+    subscribe_event(type_id, [this, cb = std::move(cb)](const EventMetadata& metadata,
+                                                        DataView payload) {
+        IncomingObject incoming{0, metadata.type_id, metadata.schema_id, payload,
+                                metadata.source_timestamp, metadata.source};
+        DynamicObject object;
+        if (!decode_dynamic_object(incoming, object)) return;
+        cb(metadata, object);
+    });
+}
+
+bool Node::request_event_replay(TypeId type_id, Timestamp since,
+                                std::size_t max_events) {
+    if (!started_ || discovery_ == nullptr) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[event] replay request rejected: node not started";
+        return false;
+    }
+    protocol::EventReplayRequest request;
+    request.request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+    request.type_id = type_id;
+    request.since = since;
+    request.max_events = static_cast<std::uint32_t>(
+        max_events == 0 ? 1000 : std::min<std::size_t>(max_events, 0xFFFFFFFFULL));
+
+    std::byte payload_storage[64];
+    ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+    if (!protocol::encode_event_replay_request(request, writer)) {
+        ISDM_LOG_TIME(warning, 1000) << "[event] replay request encode failed";
+        return false;
+    }
+    protocol::Header header;
+    header.message_type = protocol::MessageType::kEventReplayRequest;
+    std::byte frame_storage[128];
+    ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+    if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer)) {
+        ISDM_LOG_TIME(warning, 1000) << "[event] replay request frame encode failed";
+        return false;
+    }
+    const bool sent =
+        send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
+    ISDM_LOG(info) << "[event] replay requested type_id=" << type_id
+                   << " since=" << since << " max_events=" << request.max_events
+                   << " request_id=" << request.request_id
+                   << " sent=" << (sent ? "true" : "false");
+    return sent;
+}
+
+Timestamp Node::event_watermark(TypeId type_id) const {
+    std::lock_guard<std::mutex> lock(event_time_mutex_);
+    const auto it = event_watermarks_.find(type_id);
+    return it == event_watermarks_.end() ? 0 : it->second;
+}
+
+void Node::set_event_watermark_callback(EventWatermarkCallback cb) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    event_watermark_callback_ = std::move(cb);
+}
+
+std::size_t Node::event_history_size() const { return event_history_.size(); }
+
+void Node::note_event_time(TypeId type_id, Timestamp source_timestamp) {
+    if (source_timestamp <= 0) return;
+    std::lock_guard<std::mutex> lock(event_time_mutex_);
+    Timestamp& max_ts = event_max_source_ts_[type_id];
+    if (source_timestamp > max_ts) max_ts = source_timestamp;
+}
+
+void Node::maybe_advance_event_watermarks() {
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<std::pair<TypeId, Timestamp>> advances;
+    {
+        std::lock_guard<std::mutex> lock(event_time_mutex_);
+        if (now - last_event_watermark_check_ < std::chrono::milliseconds(100)) return;
+        last_event_watermark_check_ = now;
+        const Timestamp lateness_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          config_.event_watermark_lateness)
+                                          .count();
+        for (const auto& [type_id, max_ts] : event_max_source_ts_) {
+            const Timestamp candidate =
+                max_ts > lateness_ns ? max_ts - lateness_ns : 0;
+            Timestamp& watermark = event_watermarks_[type_id];
+            if (candidate > watermark) {
+                watermark = candidate;
+                advances.emplace_back(type_id, watermark);
+            }
+        }
+    }
+    event_history_.prune(now_ns());
+    if (advances.empty()) return;
+    EventWatermarkCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        cb = event_watermark_callback_;
+    }
+    if (!cb) return;
+    for (const auto& [type_id, watermark] : advances) {
+        ISDM_LOG(debug) << "[event] watermark type_id=" << type_id
+                        << " value=" << watermark;
+        cb(type_id, watermark);
+    }
+}
+
+void Node::dispatch_event(const EventMetadata& metadata, DataView payload) {
+    std::vector<EventCallback> type_callbacks;
+    std::vector<EventCallback> all_callbacks;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        for (auto& [tid, cb] : by_event_type_) {
+            if (tid == metadata.type_id) type_callbacks.push_back(cb);
+        }
+        all_callbacks = event_all_;
+    }
+    for (auto& cb : type_callbacks) cb(metadata, payload);
+    for (auto& cb : all_callbacks) cb(metadata, payload);
+}
+
+void Node::handle_event_payload(DataView payload, SchemaId schema_id,
+                                std::uint64_t sequence,
+                                const transport::Endpoint& source) {
+    protocol::EventMessage message;
+    if (!protocol::decode_event(payload, message)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[event] malformed event from " << source.to_string()
+            << " bytes=" << payload.size();
+        return;
+    }
+    if (message.type_id == 0) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[event] drop event with type_id=0 from " << source.to_string();
+        return;
+    }
+
+    EventMetadata metadata;
+    metadata.event_id = message.event_id;
+    metadata.type_id = message.type_id;
+    metadata.schema_id = schema_id;
+    metadata.severity = message.severity;
+    metadata.source_timestamp = message.source_timestamp;
+    metadata.receive_timestamp = now_ns();
+    metadata.sequence = sequence;
+    metadata.source = source;
+    metadata.replay = (message.flags & protocol::kEventFlagReplay) != 0;
+
+    EventRecord record;
+    record.metadata = metadata;
+    if (message.payload.size() != 0) {
+        record.payload.assign(message.payload.data(),
+                              message.payload.data() + message.payload.size());
+    }
+    const EventStore::AppendResult stored = event_history_.append(std::move(record));
+    if (stored == EventStore::AppendResult::kDuplicate) {
+        metrics_.rx_event_duplicates++;
+        ISDM_LOG(debug) << "[event] duplicate event_id=" << message.event_id
+                        << " type_id=" << message.type_id
+                        << " source=" << source.to_string();
+        return;
+    }
+    if (stored == EventStore::AppendResult::kRejected) {
+        metrics_.rx_dropped++;
+        ISDM_LOG_TIME(warning, 1000)
+            << "[event] history rejected event_id=" << message.event_id
+            << " type_id=" << message.type_id << " bytes=" << message.payload.size();
+        return;
+    }
+
+    metrics_.rx_events++;
+    if (metadata.replay) metrics_.rx_event_replays++;
+    note_event_time(metadata.type_id, metadata.source_timestamp);
+    ISDM_LOG(debug) << "[event] receive event_id=" << metadata.event_id
+                    << " type_id=" << metadata.type_id
+                    << " severity=" << event_severity_name(metadata.severity)
+                    << " source_ts=" << metadata.source_timestamp
+                    << " replay=" << (metadata.replay ? "true" : "false");
+    dispatch_event(metadata, message.payload);
+}
+
+void Node::handle_event_replay_request(DataView payload,
+                                       const transport::Endpoint& source) {
+    protocol::EventReplayRequest request;
+    if (!protocol::decode_event_replay_request(payload, request)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[event] malformed replay request from " << source.to_string();
+        return;
+    }
+    std::size_t limit = request.max_events == 0 ? 1000 : request.max_events;
+    if (config_.max_event_history != 0) {
+        limit = std::min(limit, config_.max_event_history);
+    }
+    const std::vector<EventRecord> records =
+        event_history_.query(request.type_id, request.since, limit);
+    // Serve only locally-originated events. Relay nodes also retain received
+    // events, but replaying them would change the transport source and bypass
+    // the receiver's (source, event_id) dedup key.
+    const transport::Endpoint local =
+        data_ == nullptr ? transport::Endpoint{} : data_->local_endpoint();
+    std::size_t sent = 0;
+    for (const EventRecord& record : records) {
+        if (record.metadata.source != local) continue;
+        if (send_event_record(record, source, true)) ++sent;
+    }
+    ISDM_LOG(info) << "[event] replay request request_id=" << request.request_id
+                   << " type_id=" << request.type_id << " since=" << request.since
+                   << " candidates=" << records.size() << " sent=" << sent << " to "
+                   << source.to_string();
+}
+
+bool Node::send_event_record(const EventRecord& record,
+                             const transport::Endpoint& dest, bool replay) {
+    protocol::EventMessage message;
+    message.event_id = record.metadata.event_id;
+    message.type_id = record.metadata.type_id;
+    message.severity = record.metadata.severity;
+    message.flags = replay ? protocol::kEventFlagReplay : 0U;
+    message.source_timestamp = record.metadata.source_timestamp;
+    message.payload = DataView(record.payload.data(), record.payload.size());
+
+    std::byte payload_storage[kMaxFrame];
+    ByteWriter payload_writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+    if (!protocol::encode_event(message, payload_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[event] replay encode failed event_id=" << record.metadata.event_id;
+        return false;
+    }
+    protocol::Header header;
+    header.message_type = protocol::MessageType::kEvent;
+    header.sequence = next_sequence();
+    header.schema_id = record.metadata.schema_id;
+    std::byte frame_storage[kMaxFrame];
+    ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+    if (!protocol::encode_frame(header, payload_storage, payload_writer.offset(),
+                                frame_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[event] replay frame encode failed event_id="
+            << record.metadata.event_id;
+        return false;
+    }
+    metrics_.tx_events++;
+    return send_to_peer(DataView(frame_storage, frame_writer.offset()), dest);
+}
+
 void Node::subscribe_delta(TypeId type_id, DataCallback cb) {
     ISDM_LOG(debug) << "[node] subscribe delta type_id=" << type_id;
     delta_enabled_.store(true, std::memory_order_release);
@@ -609,6 +983,12 @@ void Node::dispatch_frame(DataView frame_bytes, const transport::Endpoint& sourc
         handle_snapshot_payload(frame.payload, source);
     } else if (frame.header.message_type == protocol::MessageType::kSnapshotRequest) {
         handle_snapshot_request(frame.payload, source);
+    } else if (frame.header.message_type == protocol::MessageType::kEvent) {
+        handle_event_payload(frame.payload, frame.header.schema_id,
+                             frame.header.sequence, source);
+    } else if (frame.header.message_type ==
+               protocol::MessageType::kEventReplayRequest) {
+        handle_event_replay_request(frame.payload, source);
     } else {
         ISDM_LOG_TIME(warning, 1000)
             << "[protocol] unknown message_type="
@@ -894,6 +1274,7 @@ void Node::pump_once() {
         for (int i = 0; i < 4; ++i) discovery_->poll_once();
     }
     drain_data();
+    maybe_advance_event_watermarks();
 }
 
 void Node::control_loop() {
@@ -927,6 +1308,7 @@ void Node::data_loop() {
     auto last_evict = std::chrono::steady_clock::now();
     while (running_.load(std::memory_order_acquire)) {
         drain_data();
+        maybe_advance_event_watermarks();
         const auto now = std::chrono::steady_clock::now();
         if (now - last_evict >= std::chrono::seconds(1)) {
             assembler_.expire(now, std::chrono::seconds(10));

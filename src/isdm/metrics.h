@@ -43,6 +43,10 @@ public:
     std::atomic<std::uint64_t> rx_duplicates{0};
     std::atomic<std::uint64_t> tx_snapshot_requests{0};
     std::atomic<std::uint64_t> retry_count{0};
+    std::atomic<std::uint64_t> tx_events{0};
+    std::atomic<std::uint64_t> rx_events{0};
+    std::atomic<std::uint64_t> rx_event_duplicates{0};
+    std::atomic<std::uint64_t> rx_event_replays{0};
 
     struct Snapshot {
         std::uint64_t tx_frames;
@@ -78,6 +82,10 @@ public:
         std::uint64_t rx_duplicates;
         std::uint64_t tx_snapshot_requests;
         std::uint64_t retry_count;
+        std::uint64_t tx_events;
+        std::uint64_t rx_events;
+        std::uint64_t rx_event_duplicates;
+        std::uint64_t rx_event_replays;
     };
 
     Snapshot snapshot() const noexcept;
@@ -117,7 +125,11 @@ inline Metrics::Snapshot Metrics::snapshot() const noexcept {
                     rx_gaps.load(std::memory_order_relaxed),
                     rx_duplicates.load(std::memory_order_relaxed),
                     tx_snapshot_requests.load(std::memory_order_relaxed),
-                    retry_count.load(std::memory_order_relaxed)};
+                    retry_count.load(std::memory_order_relaxed),
+                    tx_events.load(std::memory_order_relaxed),
+                    rx_events.load(std::memory_order_relaxed),
+                    rx_event_duplicates.load(std::memory_order_relaxed),
+                    rx_event_replays.load(std::memory_order_relaxed)};
 }
 
 inline void Metrics::reset() noexcept {
@@ -154,6 +166,10 @@ inline void Metrics::reset() noexcept {
     rx_duplicates = 0;
     tx_snapshot_requests = 0;
     retry_count = 0;
+    tx_events = 0;
+    rx_events = 0;
+    rx_event_duplicates = 0;
+    rx_event_replays = 0;
 }
 
 }  // namespace isdm

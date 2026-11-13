@@ -18,6 +18,7 @@
 #include "isdm/codec/codec.h"
 #include "isdm/codec/object_codec.h"
 #include "isdm/core/data_view.h"
+#include "isdm/core/event.h"
 #include "isdm/core/types.h"
 #include "isdm/discovery/peer_table.h"
 #include "isdm/metrics.h"
@@ -28,6 +29,7 @@
 #include "isdm/protocol/header.h"
 #include "isdm/protocol/schema_sync.h"
 #include "isdm/protocol/snapshot.h"
+#include "isdm/runtime/event_store.h"
 #include "isdm/runtime/object_state_store.h"
 #include "isdm/schema/schema_registry.h"
 #include "isdm/transport/endpoint.h"
@@ -78,6 +80,13 @@ struct NodeConfig {
     std::size_t snapshot_staging_limit_bytes = 64ULL * 1024ULL * 1024ULL;
     // 接收端 staging 超时；不完整快照会被丢弃。
     std::chrono::milliseconds snapshot_timeout{5000};
+
+    // 事件历史（用于 replay）：按条数/字节/接收时间有界。
+    std::size_t max_event_history = 10000U;
+    std::size_t max_event_history_bytes = 64ULL * 1024ULL * 1024ULL;
+    std::chrono::milliseconds event_history_age{300000};
+    // watermark = 已观察最大 source timestamp - lateness。
+    std::chrono::milliseconds event_watermark_lateness{100};
 };
 
 // Application-facing node: composes discovery, schema registry, and the
@@ -91,6 +100,12 @@ public:
     using DynamicObjectCallback = std::function<void(ObjectId, const DynamicObject&)>;
     // Fires when a schema becomes known locally or is synced from a peer.
     using TypeDiscoveredCallback = std::function<void(const TypeDescriptor&)>;
+    // Event callbacks: payload points into the receive buffer for the duration
+    // of the callback.
+    using EventCallback = std::function<void(const EventMetadata&, DataView)>;
+    using DynamicEventCallback =
+        std::function<void(const EventMetadata&, const DynamicObject&)>;
+    using EventWatermarkCallback = std::function<void(TypeId, Timestamp)>;
 
     explicit Node(NodeConfig config);
     ~Node();
@@ -279,6 +294,82 @@ public:
     // call Node::stop(). The descriptor stays valid while this Node is alive.
     void set_type_discovered_callback(TypeDiscoveredCallback cb);
 
+    // ── Event API ──────────────────────────────────────────────────────────
+    // Events are not object state: they are not deduped by timestamp and do
+    // not participate in snapshots. History is bounded and used only by replay.
+    bool publish_event(EventId event_id, TypeId type_id, EventSeverity severity,
+                       DataView payload, Timestamp source_ts = 0);
+    bool publish_event(EventId event_id, TypeId type_id, EventSeverity severity,
+                       DataView payload, Timestamp source_ts, SchemaId schema_id);
+
+    template <typename T>
+    bool publish_event_typed(EventId event_id, TypeId type_id, EventSeverity severity,
+                             const T& value, Timestamp source_ts = 0) {
+        std::shared_ptr<ReflectedType> type;
+        {
+            std::shared_lock<std::shared_mutex> lock(typed_mutex_);
+            const auto it = typed_types_.find(type_id);
+            if (it == typed_types_.end()) {
+                log_event_publish_failure("publish_event_typed", event_id, type_id,
+                                          "type is not registered locally");
+                return false;
+            }
+            type = it->second;
+        }
+        std::byte payload_storage[kMaxFrame];
+        ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+        if (!ObjectCodec::encode(*type, &value, writer)) {
+            log_event_publish_failure("publish_event_typed", event_id, type_id,
+                                      "encode failed");
+            metrics_.tx_encode_errors++;
+            return false;
+        }
+        return publish_event_encoded(event_id, type_id, severity,
+                                     DataView(payload_storage, writer.offset()), source_ts,
+                                     schema_fingerprint(type->descriptor()));
+    }
+
+    bool publish_event_dynamic(EventId event_id, TypeId type_id, EventSeverity severity,
+                               const DynamicObject& object, Timestamp source_ts = 0);
+
+    void subscribe_event(TypeId type_id, EventCallback cb);
+    void subscribe_all_events(EventCallback cb);
+
+    template <typename T>
+    void subscribe_event_typed(
+        TypeId type_id, std::function<void(const EventMetadata&, const T&)> cb) {
+        auto type = typed_type<T>(type_id);
+        subscribe_event(type_id, [this, type, cb = std::move(cb)](
+                                     const EventMetadata& metadata, DataView payload) {
+            if (!cb) return;
+            IncomingObject incoming{0, metadata.type_id, metadata.schema_id, payload,
+                                    metadata.source_timestamp, metadata.source};
+            if (!typed_schema_ok(*type, incoming)) return;
+            T value{};
+            ByteReader reader(payload);
+            if (ObjectCodec::decode(*type, reader, &value)) {
+                cb(metadata, value);
+            } else {
+                log_decode_failure("subscribe_event_typed", 0, metadata.type_id,
+                                   metadata.schema_id);
+                metrics_.rx_decode_errors++;
+            }
+        });
+    }
+
+    void subscribe_event_dynamic(TypeId type_id, DynamicEventCallback cb);
+
+    // Requests retained events from all online peers. type_id == 0 means all
+    // types; since filters on source_timestamp; max_events == 0 uses 1000.
+    bool request_event_replay(TypeId type_id = 0, Timestamp since = 0,
+                              std::size_t max_events = 1000);
+
+    // Max observed source timestamp minus lateness for this TypeId, or 0.
+    Timestamp event_watermark(TypeId type_id) const;
+    // Fires from the data thread; callback must not block or call Node::stop().
+    void set_event_watermark_callback(EventWatermarkCallback cb);
+    std::size_t event_history_size() const;
+
     // Delta subscription: the callback always receives the FULL current value.
     // The first full object seeds the cache; subsequent deltas patch it.
     void subscribe_delta(TypeId type_id, DataCallback cb);
@@ -401,6 +492,19 @@ private:
     bool decode_dynamic_object(const IncomingObject& in, DynamicObject& out);
     void notify_type_discovered(const TypeDescriptor& descriptor);
     void resolve_name_subscriptions(const TypeDescriptor& descriptor);
+    bool publish_event_encoded(EventId event_id, TypeId type_id, EventSeverity severity,
+                               DataView payload, Timestamp source_ts, SchemaId schema_id);
+    void handle_event_payload(DataView payload, SchemaId schema_id,
+                              std::uint64_t sequence, const transport::Endpoint& source);
+    void handle_event_replay_request(DataView payload,
+                                     const transport::Endpoint& source);
+    bool send_event_record(const EventRecord& record, const transport::Endpoint& dest,
+                           bool replay);
+    void dispatch_event(const EventMetadata& metadata, DataView payload);
+    void note_event_time(TypeId type_id, Timestamp source_timestamp);
+    void maybe_advance_event_watermarks();
+    void log_event_publish_failure(const char* operation, EventId event_id, TypeId type_id,
+                                   const char* reason);
     void log_publish_failure(const char* operation, ObjectId object_id, TypeId type_id,
                              const char* reason);
     void log_registration_failure(TypeId type_id, Version version, const char* reason);
@@ -508,6 +612,14 @@ private:
     std::vector<DynamicObjectCallback> dynamic_all_;
     std::vector<std::pair<std::string, DynamicObjectCallback>> pending_by_name_;
     TypeDiscoveredCallback type_discovered_callback_;
+    std::vector<std::pair<TypeId, EventCallback>> by_event_type_;
+    std::vector<EventCallback> event_all_;
+    EventWatermarkCallback event_watermark_callback_;
+    EventStore event_history_;
+    mutable std::mutex event_time_mutex_;
+    std::unordered_map<TypeId, Timestamp> event_max_source_ts_;
+    std::unordered_map<TypeId, Timestamp> event_watermarks_;
+    std::chrono::steady_clock::time_point last_event_watermark_check_;
     std::unordered_set<NodeId> known_peers_;
     std::array<std::byte, kMaxFrame> recv_{};
     PeerStateCallback peer_state_callback_;
