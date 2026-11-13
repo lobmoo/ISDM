@@ -1,7 +1,7 @@
 # 类型发现与通配订阅设计
 
-> 日期：2026-11-12  
-> 分支：`feature/type-discovery`  
+> 日期：2026-11-12
+> 分支：`feature/type-discovery`
 > 目标：补齐自描述中间件中“订阅端不知道 TypeId 也能消费”的能力。
 
 ## 背景

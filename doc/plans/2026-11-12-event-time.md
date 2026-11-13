@@ -1,7 +1,7 @@
 # 事件与时间语义设计（M6）
 
-> 日期：2026-11-12  
-> 分支：`feature/event-time`（基于 `feature/type-discovery`）  
+> 日期：2026-11-12
+> 分支：`feature/event-time`（基于 `feature/type-discovery`）
 > 目标：在现有“对象状态 pub/sub”之外，增加第一版事件语义。
 
 ## 背景
