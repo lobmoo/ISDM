@@ -1,6 +1,7 @@
 #include "isdm/node.h"
 
 #include <algorithm>
+#include <string_view>
 #include <utility>
 
 #include "isdm/discovery/discovery_manager.h"
@@ -10,6 +11,20 @@
 #include "isdm/transport/udp_transport.h"
 
 namespace isdm {
+namespace {
+
+// Accepts either the full reflected name ("demo::Motor") or its short name
+// ("Motor"). Short names are convenient for dashboards but can be ambiguous;
+// callers that care should use the full name.
+bool type_name_matches(const char* full_name, const std::string& requested) {
+    if (full_name == nullptr) return false;
+    const std::string_view full(full_name);
+    if (full == requested) return true;
+    const auto pos = full.rfind("::");
+    return pos != std::string_view::npos && full.substr(pos + 2) == requested;
+}
+
+}  // namespace
 
 transport::Endpoint Node::data_endpoint() const noexcept {
     return data_ == nullptr ? transport::Endpoint{} : data_->local_endpoint();
@@ -37,6 +52,9 @@ bool Node::register_type(const TypeDescriptor& desc, std::size_t name_table_size
     ISDM_LOG(info) << "[schema] node registered type_id=" << desc.type_id
                    << " version=" << desc.version << " fields=" << desc.field_count
                    << " schema_id=" << fp;
+    const TypeDescriptor* stored = registry_.find(desc.type_id, desc.version);
+    if (stored == nullptr) stored = registry_.find(desc.type_id);
+    if (stored != nullptr) notify_type_discovered(*stored);
     return true;
 }
 
@@ -273,37 +291,111 @@ void Node::subscribe_dynamic(
     subscribe_schema_aware(
         type_id, [this, cb = std::move(cb)](const IncomingObject& in) {
             if (!cb) return;
-            const TypeDescriptor* descriptor =
-                in.schema_id != 0 ? registry().find_by_fingerprint(in.schema_id)
-                                  : nullptr;
-            if (descriptor == nullptr) {
-                descriptor = registry().find(in.type_id);
-                if (descriptor == nullptr) {
-                    metrics_.rx_schema_miss++;
-                    if (in.schema_id != 0) {
-                        request_schema(in.schema_id, in.type_id, 0, in.source);
-                    }
-                    return;
-                }
-                if (in.schema_id != 0) {
-                    if (descriptor->layout == TypeLayout::kPacked) {
-                        metrics_.rx_schema_fallback++;
-                    } else {
-                        metrics_.rx_schema_miss++;
-                        request_schema(in.schema_id, in.type_id, 0, in.source);
-                        return;
-                    }
-                }
-            }
             DynamicObject obj;
-            if (!ObjectCodec::decode_dynamic(*descriptor, in.payload, obj)) {
-                log_decode_failure("subscribe_dynamic", in.object_id, in.type_id,
-                                   in.schema_id);
-                metrics_.rx_decode_errors++;
-                return;
-            }
+            if (!decode_dynamic_object(in, obj)) return;
             cb(in.object_id, obj);
         });
+}
+
+void Node::subscribe_all_dynamic(DynamicObjectCallback cb) {
+    if (!cb) return;
+    ISDM_LOG(debug) << "[node] subscribe all dynamic";
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    dynamic_all_.push_back(std::move(cb));
+}
+
+bool Node::subscribe_by_name_dynamic(const std::string& type_name,
+                                     DynamicObjectCallback cb) {
+    if (type_name.empty() || !cb) return false;
+    const TypeId type_id = find_type_id_by_name(type_name);
+    if (type_id != 0) {
+        ISDM_LOG(debug) << "[node] subscribe by name type_name=" << type_name
+                        << " type_id=" << type_id;
+        subscribe_dynamic(type_id, std::move(cb));
+        return true;
+    }
+    ISDM_LOG(debug) << "[node] subscribe by name pending: " << type_name;
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    pending_by_name_.emplace_back(type_name, std::move(cb));
+    return true;
+}
+
+TypeId Node::find_type_id_by_name(const std::string& type_name) const {
+    TypeId result = 0;
+    registry_.for_each_type([&](const TypeDescriptor& descriptor) {
+        if (result != 0) return;
+        const char* name = SchemaRegistry::type_name(descriptor);
+        if (type_name_matches(name, type_name)) result = descriptor.type_id;
+    });
+    return result;
+}
+
+void Node::set_type_discovered_callback(TypeDiscoveredCallback cb) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    type_discovered_callback_ = std::move(cb);
+}
+
+bool Node::decode_dynamic_object(const IncomingObject& in, DynamicObject& out) {
+    const TypeDescriptor* descriptor =
+        in.schema_id != 0 ? registry().find_by_fingerprint(in.schema_id) : nullptr;
+    if (descriptor == nullptr) {
+        descriptor = registry().find(in.type_id);
+        if (descriptor == nullptr) {
+            metrics_.rx_schema_miss++;
+            if (in.schema_id != 0) {
+                request_schema(in.schema_id, in.type_id, 0, in.source);
+            }
+            return false;
+        }
+        if (in.schema_id != 0) {
+            if (descriptor->layout == TypeLayout::kPacked) {
+                metrics_.rx_schema_fallback++;
+            } else {
+                metrics_.rx_schema_miss++;
+                request_schema(in.schema_id, in.type_id, 0, in.source);
+                return false;
+            }
+        }
+    }
+    if (!ObjectCodec::decode_dynamic(*descriptor, in.payload, out)) {
+        log_decode_failure("subscribe_dynamic", in.object_id, in.type_id, in.schema_id);
+        metrics_.rx_decode_errors++;
+        return false;
+    }
+    return true;
+}
+
+void Node::notify_type_discovered(const TypeDescriptor& descriptor) {
+    TypeDiscoveredCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        cb = type_discovered_callback_;
+    }
+    resolve_name_subscriptions(descriptor);
+    if (cb) cb(descriptor);
+}
+
+void Node::resolve_name_subscriptions(const TypeDescriptor& descriptor) {
+    const char* type_name = SchemaRegistry::type_name(descriptor);
+    if (type_name == nullptr) return;
+
+    std::vector<DynamicObjectCallback> matched;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        for (auto it = pending_by_name_.begin(); it != pending_by_name_.end();) {
+            if (type_name_matches(type_name, it->first)) {
+                matched.push_back(std::move(it->second));
+                it = pending_by_name_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (DynamicObjectCallback& cb : matched) {
+        ISDM_LOG(debug) << "[node] activate pending subscription type_name=" << type_name
+                        << " type_id=" << descriptor.type_id;
+        subscribe_dynamic(descriptor.type_id, std::move(cb));
+    }
 }
 
 void Node::subscribe_delta(TypeId type_id, DataCallback cb) {
@@ -1078,6 +1170,10 @@ void Node::handle_schema_response(DataView payload) {
         ISDM_LOG(debug) << "[schema] received schema type_id=" << response.type_id
                         << " version=" << response.descriptor().version
                         << " request_id=" << response.request_id;
+        const TypeDescriptor* stored =
+            registry().find(response.type_id, response.descriptor().version);
+        if (stored == nullptr) stored = registry().find(response.type_id);
+        if (stored != nullptr) notify_type_discovered(*stored);
     }
 }
 
@@ -1479,6 +1575,7 @@ void Node::dispatch(ObjectId object_id, TypeId type_id, SchemaId schema_id, Data
                     Timestamp timestamp, const transport::Endpoint& source) {
     std::vector<DataCallback> callbacks;
     std::vector<SchemaCallback> schema_callbacks;
+    std::vector<DynamicObjectCallback> dynamic_callbacks;
     {
         std::lock_guard<std::mutex> lock(callback_mutex_);
         for (auto& [oid, cb] : by_object_) {
@@ -1490,6 +1587,7 @@ void Node::dispatch(ObjectId object_id, TypeId type_id, SchemaId schema_id, Data
         for (auto& [tid, cb] : by_type_schema_) {
             if (tid == type_id) schema_callbacks.push_back(cb);
         }
+        dynamic_callbacks = dynamic_all_;
     }
     for (auto& cb : callbacks) {
         cb(object_id, type_id, payload, timestamp);
@@ -1497,6 +1595,14 @@ void Node::dispatch(ObjectId object_id, TypeId type_id, SchemaId schema_id, Data
     IncomingObject incoming{object_id, type_id, schema_id, payload, timestamp, source};
     for (auto& cb : schema_callbacks) {
         cb(incoming);
+    }
+    if (!dynamic_callbacks.empty()) {
+        DynamicObject obj;
+        if (decode_dynamic_object(incoming, obj)) {
+            for (auto& cb : dynamic_callbacks) {
+                cb(object_id, obj);
+            }
+        }
     }
 }
 

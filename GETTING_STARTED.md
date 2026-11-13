@@ -309,6 +309,40 @@ int main() {
 
 库内约定：`error` 用于启动/网络/编码/分配失败；`warning` 用于 peer 超时、schema 缺失、快照丢弃/超限、重试耗尽；`info` 用于节点启停、peer 上下线、schema 注册、快照开始/结束；`debug` 用于订阅、schema 请求和快照细节。高频错误用 `LOG_TIME(level, interval_ms)` 限速。
 
+### 6.6 类型发现与通配订阅
+
+订阅端可以不知道 `TypeId` 和业务结构体，只依赖运行时 schema：
+
+```cpp
+// schema 到达时通知（本地注册或远端同步）
+subscriber.set_type_discovered_callback([](const isdm::TypeDescriptor& desc) {
+    std::printf("discovered %s type_id=%u\n",
+                isdm::SchemaRegistry::type_name(desc), desc.type_id);
+});
+
+// 消费所有类型；每个对象按 sender schema 解码一次
+subscriber.subscribe_all_dynamic([](isdm::ObjectId id, const isdm::DynamicObject& obj) {
+    std::printf("object=%llu type=%s fields=%zu\n",
+                static_cast<unsigned long long>(id),
+                isdm::SchemaRegistry::type_name(*obj.descriptor),
+                obj.fields.size());
+});
+
+// 按类型名订阅；schema 未到达时先挂起
+subscriber.subscribe_by_name_dynamic("Temperature",
+    [](isdm::ObjectId, const isdm::DynamicObject& obj) { /* ... */ });
+
+// 名字查找：全名 demo::Motor 或短名 Motor 都可以
+const isdm::TypeId id = subscriber.find_type_id_by_name("Motor");
+```
+
+运行示例：
+
+```bash
+./build/examples/isdm_demo_type_discovery
+# 期望：discovered_types=2 all_objects=2 by_name_temperature=1
+```
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。
