@@ -1,7 +1,7 @@
 # Command / ACK 设计（M7）
 
-> 日期：2026-11-13  
-> 分支：`feature/command-ack`（基于 `dev`）  
+> 日期：2026-11-13
+> 分支：`feature/command-ack`（基于 `dev`）
 > 目标：在 Data/Event 之外增加定向控制命令与 ACK/NACK。
 
 ## 背景
