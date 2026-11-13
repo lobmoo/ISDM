@@ -27,6 +27,8 @@ enum class MessageType : std::uint8_t {
     kSnapshotRequest = 13,
     kEvent = 14,
     kEventReplayRequest = 15,
+    kCommand = 16,
+    kCommandAck = 17,
     kHeartbeat = 20,
     kControl = 30,
     kAck = 31,

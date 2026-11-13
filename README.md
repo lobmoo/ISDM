@@ -47,6 +47,7 @@ ctest --test-dir build --output-on-failure
 ./build/examples/isdm_demo_complex_types
 ./build/examples/isdm_demo_type_discovery
 ./build/examples/isdm_demo_events
+./build/examples/isdm_demo_commands
 
 # 安装（可选）
 cmake --install build
@@ -281,9 +282,33 @@ subscriber.set_event_watermark_callback([](TypeId type_id, Timestamp watermark) 
 - watermark 是“已观察最大 source timestamp - lateness”的进度信号，不是完整性保证，也不处理跨节点时钟偏差。
 - 新增 `examples/events`，演示晚加入 replay、live 事件和 watermark。
 
+#### 命令语义（Command / ACK）
+
+Command 是定向控制：向指定 `NodeId` 发送命令，目标 handler 返回 ACK/NACK。
+
+```cpp
+target.subscribe_command_typed<Motor>(/*command_id=*/920, /*type_id=*/100,
+    [](const isdm::CommandMetadata& meta, const Motor& value) {
+        return isdm::CommandResponse{isdm::CommandStatus::kOk, "applied"};
+    });
+
+commander.set_command_result_callback([](const isdm::CommandResult& result) {
+    // result.status: kOk / kRejected / kError / kTimeout
+});
+
+commander.send_command_typed(target_node_id, 920, 100, object_id, motor, source_ts,
+                             std::chrono::milliseconds(500));
+```
+
+- 发送端维护 pending 表：按 `command_retry_interval` 重发，超过 deadline 回调 `kTimeout`。
+- 接收端按 `(source, request_id)` 缓存 ACK/NACK；重发不重复执行 handler。
+- `CommandResult.status` 可能是 `kOk/kRejected/kError/kTimeout`；`kTimeout` 只在发送端本地产生。
+- handler 在目标数据线程执行；长耗时 handler 会阻塞该节点数据接收。
+- 没有 exactly-once/命令历史；业务 handler 仍需幂等。
+
 #### 当前尚未实现 / 后续方向
 
-- Command / ACK / NACK、事件可靠传输与 exactly-once；
+- Command 历史/认证、事件可靠传输与 exactly-once；
 - 严格时钟同步与完整事件时间（watermark 完整性）语义；
 - 数据面可靠传输（重传/ACK）；
 - 共享内存（SHM）与 60 万+ 数据点的正式验证（README 顶部部分能力属于目标/路线图）。
