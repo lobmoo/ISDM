@@ -29,6 +29,7 @@ enum class MessageType : std::uint8_t {
     kEventReplayRequest = 15,
     kCommand = 16,
     kCommandAck = 17,
+    kSubscription = 18,
     kHeartbeat = 20,
     kControl = 30,
     kAck = 31,

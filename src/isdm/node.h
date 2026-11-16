@@ -251,7 +251,8 @@ public:
             return false;
         retain(object_id, type_id, schema_id, &new_value, sizeof(T), resolved_ts);
         metrics_.tx_batches++;
-        return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
+        return send_data_frame_to_peers(DataView(frame_storage, frame_writer.offset()),
+                                        type_id);
     }
 
     // Publishes many objects of one fixed-layout type in a single frame.
@@ -306,6 +307,15 @@ public:
     // Remote schemas fire from the data thread; the callback must not block or
     // call Node::stop(). The descriptor stays valid while this Node is alive.
     void set_type_discovered_callback(TypeDiscoveredCallback cb);
+
+    // Snapshot of locally retained objects. The callback receives a copy, so it
+    // may safely call back into Node.
+    using ObjectVisitor = std::function<void(const ObjectState&)>;
+    void for_each_object(ObjectVisitor visitor) const;
+    void for_each_object(TypeId type_id, ObjectVisitor visitor) const;
+
+    // Requests the latest state of every known type from all online peers.
+    bool request_all_snapshots();
 
     // ── Event API ──────────────────────────────────────────────────────────
     // Events are not object state: they are not deduped by timestamp and do
@@ -540,6 +550,13 @@ private:
         Timestamp created = 0;
     };
 
+    struct PeerSubscription {
+        bool initialized = false;
+        bool all_data = false;
+        std::unordered_set<TypeId> types;
+        Timestamp updated = 0;
+    };
+
     struct PendingCommand {
         std::uint32_t request_id = 0;
         CommandId command_id = 0;
@@ -619,6 +636,13 @@ private:
                               ObjectId object_id, DataView payload, Timestamp source_ts,
                               SchemaId schema_id, std::chrono::milliseconds timeout);
     bool find_peer_endpoint(NodeId node_id, transport::Endpoint& out) const;
+    bool peer_accepts_data(std::uint64_t endpoint_raw, TypeId type_id) const;
+    void handle_subscription_update(DataView payload, const transport::Endpoint& source);
+    void collect_subscription_state(bool& all_data, std::vector<TypeId>& types);
+    void push_subscription_to(const transport::Endpoint& peer);
+    void broadcast_subscription_update();
+    void cleanup_peer_subscriptions();
+    bool send_data_frame_to_peers(DataView frame, TypeId type_id);
     void handle_command_payload(DataView payload, SchemaId schema_id,
                                 const transport::Endpoint& source);
     void handle_command_ack(DataView payload);
@@ -749,6 +773,8 @@ private:
     std::unordered_map<std::uint32_t, PendingCommand> pending_commands_;
     std::map<std::pair<std::uint64_t, std::uint32_t>, CachedCommandResult>
         command_results_;
+    mutable std::mutex subscription_mutex_;
+    std::unordered_map<std::uint64_t, PeerSubscription> peer_subscriptions_;
     std::unordered_set<NodeId> known_peers_;
     std::array<std::byte, kMaxFrame> recv_{};
     PeerStateCallback peer_state_callback_;

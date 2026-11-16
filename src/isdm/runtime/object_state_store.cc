@@ -102,6 +102,17 @@ std::vector<ObjectState> ObjectStateStore::snapshot(TypeId type_id) const {
     return result;
 }
 
+std::vector<ObjectState> ObjectStateStore::snapshot_all() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<ObjectState> result;
+    result.reserve(states_.size());
+    for (const auto& [key, state] : states_) {
+        (void)key;
+        result.push_back(state);
+    }
+    return result;
+}
+
 std::size_t ObjectStateStore::size() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return states_.size();

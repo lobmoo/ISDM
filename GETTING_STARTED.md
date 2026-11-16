@@ -409,6 +409,39 @@ commander.send_command_typed(target_node_id, 920, 100, object_id, motor, source_
 # 期望：results=3，ok / rejected(blocked) / rejected(no handler)
 ```
 
+### 6.9 自治订阅：扫描模型和对象
+
+subscriber 不需要提前知道 TypeId 或共享业务头文件：
+
+```cpp
+// 扫描已同步模型
+subscriber.registry().for_each_type([](const isdm::TypeDescriptor& desc) {
+    std::printf("type=%s id=%u\n", isdm::SchemaRegistry::type_name(desc), desc.type_id);
+});
+
+// 拉取所有已发现类型的最新状态
+subscriber.request_all_snapshots();
+
+// 扫描本地对象
+subscriber.for_each_object([](const isdm::ObjectState& state) {
+    std::printf("type=%u object=%llu\n", state.type_id,
+                static_cast<unsigned long long>(state.object_id));
+});
+
+// 按需订阅
+subscriber.subscribe_by_name_dynamic("Temperature",
+    [](isdm::ObjectId, const isdm::DynamicObject& obj) { /* ... */ });
+```
+
+publisher 会按 subscriber 上报的兴趣集合，只发送匹配 TypeId 的 data/delta/batch；未声明兴趣的 peer 仍接收全部数据。
+
+运行示例：
+
+```bash
+./build/examples/isdm_demo_autonomous_subscriber
+# 期望：扫描到 Motor/Temperature 模型、3 个对象，temperature_objects=2
+```
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。

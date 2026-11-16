@@ -54,6 +54,8 @@ public:
     std::atomic<std::uint64_t> rx_command_acks{0};
     std::atomic<std::uint64_t> rx_command_duplicates{0};
     std::atomic<std::uint64_t> command_timeouts{0};
+    std::atomic<std::uint64_t> tx_subscription_updates{0};
+    std::atomic<std::uint64_t> rx_subscription_updates{0};
 
     struct Snapshot {
         std::uint64_t tx_frames;
@@ -100,6 +102,8 @@ public:
         std::uint64_t rx_command_acks;
         std::uint64_t rx_command_duplicates;
         std::uint64_t command_timeouts;
+        std::uint64_t tx_subscription_updates;
+        std::uint64_t rx_subscription_updates;
     };
 
     Snapshot snapshot() const noexcept;
@@ -150,7 +154,9 @@ inline Metrics::Snapshot Metrics::snapshot() const noexcept {
                     tx_command_acks.load(std::memory_order_relaxed),
                     rx_command_acks.load(std::memory_order_relaxed),
                     rx_command_duplicates.load(std::memory_order_relaxed),
-                    command_timeouts.load(std::memory_order_relaxed)};
+                    command_timeouts.load(std::memory_order_relaxed),
+                    tx_subscription_updates.load(std::memory_order_relaxed),
+                    rx_subscription_updates.load(std::memory_order_relaxed)};
 }
 
 inline void Metrics::reset() noexcept {
@@ -198,6 +204,8 @@ inline void Metrics::reset() noexcept {
     rx_command_acks = 0;
     rx_command_duplicates = 0;
     command_timeouts = 0;
+    tx_subscription_updates = 0;
+    rx_subscription_updates = 0;
 }
 
 }  // namespace isdm

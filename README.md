@@ -48,6 +48,7 @@ ctest --test-dir build --output-on-failure
 ./build/examples/isdm_demo_type_discovery
 ./build/examples/isdm_demo_events
 ./build/examples/isdm_demo_commands
+./build/examples/isdm_demo_autonomous_subscriber
 
 # 安装（可选）
 cmake --install build
@@ -306,11 +307,44 @@ commander.send_command_typed(target_node_id, 920, 100, object_id, motor, source_
 - handler 在目标数据线程执行；长耗时 handler 会阻塞该节点数据接收。
 - 没有 exactly-once/命令历史；业务 handler 仍需幂等。
 
+#### 自治订阅与对象清单
+
+subscriber 不需要提前知道 TypeId 或共享业务头文件：
+
+```cpp
+// schema 注册后立即推送给在线 peer；也可以扫描本地 registry
+subscriber.registry().for_each_type([](const TypeDescriptor& desc) {
+    std::printf("type=%s id=%u\n", SchemaRegistry::type_name(desc), desc.type_id);
+});
+
+// 一次拉取所有已发现类型的最新状态，然后扫描对象
+subscriber.request_all_snapshots();
+subscriber.for_each_object([](const ObjectState& state) {
+    // state.type_id / object_id / timestamp / payload
+});
+subscriber.for_each_object(type_id, [](const ObjectState& state) { /* ... */ });
+
+// 按模型名或全量动态订阅
+subscriber.subscribe_by_name_dynamic("Motor", [](ObjectId, const DynamicObject& obj) {});
+subscriber.subscribe_all_dynamic([](ObjectId, const DynamicObject& obj) {});
+```
+
+publisher 侧增加了 TypeId 级订阅过滤：
+
+- subscriber 把兴趣集合通过 `SubscriptionUpdate` 发给 publisher；
+- 已声明兴趣的 peer 只收到匹配 TypeId 的 data/delta/batch；
+- 未声明兴趣的 peer 保持旧行为（接收全部）；
+- `subscribe_all_dynamic` / `subscribe_object` 会让该 peer 进入 `all_data`；
+- 事件、命令、schema、snapshot 不走该过滤器。
+
+已知边界：TypeId 仍由 publisher 分配（但 subscriber 可通过 schema 发现，不需要双方约定常量）；没有 unsubscribe；对象级过滤仍由 subscriber 完成。
+
 #### 当前尚未实现 / 后续方向
 
 - Command 历史/认证、事件可靠传输与 exactly-once；
 - 严格时钟同步与完整事件时间（watermark 完整性）语义；
 - 数据面可靠传输（重传/ACK）；
+- 对象级发布侧过滤、unsubscribe；
 - 共享内存（SHM）与 60 万+ 数据点的正式验证（README 顶部部分能力属于目标/路线图）。
 
 ### 日志

@@ -19,6 +19,7 @@ add_library(isdm_core STATIC
     isdm/protocol/schema_sync.cc
     isdm/protocol/schema_wire.cc
     isdm/protocol/snapshot.cc
+    isdm/protocol/subscription.cc
     isdm/runtime/event_store.cc
     isdm/runtime/object_state_store.cc
     isdm/schema/schema_registry.cc
