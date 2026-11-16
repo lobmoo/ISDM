@@ -44,6 +44,15 @@ target_link_libraries(isdm_demo_commands PRIVATE ISDM::core)
 target_compile_features(isdm_demo_commands PRIVATE cxx_std_17)
 target_compile_options(isdm_demo_commands PRIVATE -Wall -Wextra -Wpedantic)
 
+# Autonomous subscriber: scan models/objects, then subscribe by name.
+add_executable(isdm_demo_autonomous_subscriber
+    autonomous_subscriber/main.cc
+)
+
+target_link_libraries(isdm_demo_autonomous_subscriber PRIVATE ISDM::core)
+target_compile_features(isdm_demo_autonomous_subscriber PRIVATE cxx_std_17)
+target_compile_options(isdm_demo_autonomous_subscriber PRIVATE -Wall -Wextra -Wpedantic)
+
 # Two-process demo: independent publisher and subscriber executables.
 add_executable(isdm_publisher two_process/publisher.cc)
 target_link_libraries(isdm_publisher PRIVATE ISDM::core)

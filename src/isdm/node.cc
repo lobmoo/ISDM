@@ -10,6 +10,7 @@
 #include "isdm/protocol/command.h"
 #include "isdm/protocol/data_message.h"
 #include "isdm/protocol/event.h"
+#include "isdm/protocol/subscription.h"
 #include "isdm/transport/udp_transport.h"
 
 namespace isdm {
@@ -63,6 +64,15 @@ bool Node::register_type(const TypeDescriptor& desc, std::size_t name_table_size
     const TypeDescriptor* stored = registry_.find(desc.type_id, desc.version);
     if (stored == nullptr) stored = registry_.find(desc.type_id);
     if (stored != nullptr) notify_type_discovered(*stored);
+    if (discovery_ != nullptr) {
+        std::vector<transport::Endpoint> peers;
+        discovery_->peers().for_each([&](const PeerInfo& peer) {
+            if (peer.online) peers.push_back(peer.endpoint);
+        });
+        for (const transport::Endpoint& peer : peers) {
+            push_schemas_to(peer);
+        }
+    }
     return true;
 }
 
@@ -233,7 +243,8 @@ bool Node::publish_delta(ObjectId object_id, TypeId type_id, const void* old_byt
     }
     retain(object_id, type_id, schema_id, new_bytes, struct_size, resolved_ts);
     metrics_.tx_batches++;
-    return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
+    return send_data_frame_to_peers(DataView(frame_storage, frame_writer.offset()),
+                                    type_id);
 }
 
 bool Node::publish_batch(const ObjectId* ids, const void* payloads, std::size_t count,
@@ -284,13 +295,17 @@ bool Node::publish_batch(const ObjectId* ids, const void* payloads, std::size_t 
                resolved_ts);
     }
     metrics_.tx_batches++;
-    return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
+    return send_data_frame_to_peers(DataView(frame_storage, frame_writer.offset()),
+                                    type_id);
 }
 
 void Node::subscribe(TypeId type_id, DataCallback cb) {
     ISDM_LOG(debug) << "[node] subscribe raw type_id=" << type_id;
-    std::lock_guard<std::mutex> lock(callback_mutex_);
-    by_type_.emplace_back(type_id, std::move(cb));
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        by_type_.emplace_back(type_id, std::move(cb));
+    }
+    broadcast_subscription_update();
 }
 
 void Node::subscribe_dynamic(
@@ -308,8 +323,11 @@ void Node::subscribe_dynamic(
 void Node::subscribe_all_dynamic(DynamicObjectCallback cb) {
     if (!cb) return;
     ISDM_LOG(debug) << "[node] subscribe all dynamic";
-    std::lock_guard<std::mutex> lock(callback_mutex_);
-    dynamic_all_.push_back(std::move(cb));
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        dynamic_all_.push_back(std::move(cb));
+    }
+    broadcast_subscription_update();
 }
 
 bool Node::subscribe_by_name_dynamic(const std::string& type_name,
@@ -1167,6 +1185,172 @@ void Node::retry_pending_commands(std::chrono::steady_clock::time_point now) {
     }
 }
 
+void Node::for_each_object(ObjectVisitor visitor) const {
+    if (!visitor) return;
+    const std::vector<ObjectState> states = state_store_.snapshot_all();
+    for (const ObjectState& state : states) visitor(state);
+}
+
+void Node::for_each_object(TypeId type_id, ObjectVisitor visitor) const {
+    if (!visitor) return;
+    const std::vector<ObjectState> states = state_store_.snapshot(type_id);
+    for (const ObjectState& state : states) visitor(state);
+}
+
+bool Node::request_all_snapshots() {
+    if (!started_) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[snapshot] request_all_snapshots rejected: node not started";
+        return false;
+    }
+    std::vector<TypeId> types;
+    registry_.for_each_type([&](const TypeDescriptor& descriptor) {
+        types.push_back(descriptor.type_id);
+    });
+    bool any = false;
+    for (TypeId type_id : types) {
+        if (request_snapshot(type_id)) any = true;
+    }
+    ISDM_LOG(info) << "[snapshot] request_all_snapshots types=" << types.size()
+                   << " sent=" << (any ? "true" : "false");
+    return any;
+}
+
+void Node::collect_subscription_state(bool& all_data,
+                                      std::vector<TypeId>& types) {
+    types.clear();
+    std::unordered_set<TypeId> unique;
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        all_data = !dynamic_all_.empty() || !by_object_.empty();
+        for (const auto& [type_id, cb] : by_type_) {
+            (void)cb;
+            if (unique.insert(type_id).second) types.push_back(type_id);
+        }
+        for (const auto& [type_id, cb] : by_type_schema_) {
+            (void)cb;
+            if (unique.insert(type_id).second) types.push_back(type_id);
+        }
+    }
+}
+
+void Node::push_subscription_to(const transport::Endpoint& peer) {
+    bool all_data = false;
+    std::vector<TypeId> types;
+    collect_subscription_state(all_data, types);
+    if (!all_data && types.empty()) return;
+    if (types.size() > protocol::kMaxSubscriptionTypes) {
+        all_data = true;
+        types.clear();
+    }
+
+    protocol::SubscriptionUpdate update;
+    update.all_data = all_data;
+    update.types = std::move(types);
+
+    std::byte payload_storage[kMaxFrame];
+    ByteWriter writer(MutableDataView(payload_storage, sizeof(payload_storage)));
+    if (!protocol::encode_subscription(update, writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[subscription] encode failed for " << peer.to_string();
+        return;
+    }
+    protocol::Header header;
+    header.message_type = protocol::MessageType::kSubscription;
+    std::byte frame_storage[kMaxFrame];
+    ByteWriter frame_writer(MutableDataView(frame_storage, sizeof(frame_storage)));
+    if (!protocol::encode_frame(header, payload_storage, writer.offset(), frame_writer)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[subscription] frame encode failed for " << peer.to_string();
+        return;
+    }
+    if (send_to_peer(DataView(frame_storage, frame_writer.offset()), peer) != 0) {
+        metrics_.tx_subscription_updates++;
+        ISDM_LOG(debug) << "[subscription] sent to " << peer.to_string()
+                        << " all_data=" << all_data
+                        << " types=" << update.types.size();
+    }
+}
+
+void Node::broadcast_subscription_update() {
+    if (!started_ || discovery_ == nullptr) return;
+    bool all_data = false;
+    std::vector<TypeId> types;
+    collect_subscription_state(all_data, types);
+    if (!all_data && types.empty()) return;
+    std::vector<transport::Endpoint> peers;
+    discovery_->peers().for_each([&](const PeerInfo& peer) {
+        if (peer.online) peers.push_back(peer.endpoint);
+    });
+    for (const transport::Endpoint& peer : peers) {
+        push_subscription_to(peer);
+    }
+}
+
+void Node::cleanup_peer_subscriptions() {
+    if (discovery_ == nullptr) return;
+    std::unordered_set<std::uint64_t> present;
+    discovery_->peers().for_each([&](const PeerInfo& peer) {
+        present.insert(peer.endpoint.to_raw());
+    });
+    std::lock_guard<std::mutex> lock(subscription_mutex_);
+    for (auto it = peer_subscriptions_.begin(); it != peer_subscriptions_.end();) {
+        if (present.find(it->first) == present.end()) {
+            it = peer_subscriptions_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Node::handle_subscription_update(DataView payload,
+                                      const transport::Endpoint& source) {
+    protocol::SubscriptionUpdate update;
+    if (!protocol::decode_subscription(payload, update)) {
+        ISDM_LOG_TIME(warning, 1000)
+            << "[subscription] malformed update from " << source.to_string();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(subscription_mutex_);
+        PeerSubscription& subscription = peer_subscriptions_[source.to_raw()];
+        subscription.initialized = true;
+        subscription.all_data = update.all_data;
+        subscription.types.clear();
+        subscription.types.insert(update.types.begin(), update.types.end());
+        subscription.updated = now_ns();
+    }
+    metrics_.rx_subscription_updates++;
+    ISDM_LOG(debug) << "[subscription] received from " << source.to_string()
+                    << " all_data=" << update.all_data
+                    << " types=" << update.types.size();
+}
+
+bool Node::peer_accepts_data(std::uint64_t endpoint_raw, TypeId type_id) const {
+    std::lock_guard<std::mutex> lock(subscription_mutex_);
+    const auto it = peer_subscriptions_.find(endpoint_raw);
+    if (it == peer_subscriptions_.end() || !it->second.initialized) return true;
+    if (it->second.all_data) return true;
+    return it->second.types.find(type_id) != it->second.types.end();
+}
+
+bool Node::send_data_frame_to_peers(DataView frame, TypeId type_id) {
+    metrics_.tx_frames++;
+    metrics_.tx_bytes += frame.size();
+    bool sent = false;
+    discovery_->peers().for_each([&](const PeerInfo& peer) {
+        if (!peer.online) return;
+        if (!peer_accepts_data(peer.endpoint.to_raw(), type_id)) return;
+        if (send_to_peer(frame, peer.endpoint)) sent = true;
+    });
+    if (!sent) {
+        ISDM_LOG_TIME(debug, 1000)
+            << "[node] no peer accepted data frame, type_id=" << type_id
+            << " bytes=" << frame.size();
+    }
+    return sent;
+}
+
 void Node::subscribe_delta(TypeId type_id, DataCallback cb) {
     ISDM_LOG(debug) << "[node] subscribe delta type_id=" << type_id;
     delta_enabled_.store(true, std::memory_order_release);
@@ -1175,8 +1359,13 @@ void Node::subscribe_delta(TypeId type_id, DataCallback cb) {
 
 void Node::subscribe_object(ObjectId object_id, DataCallback cb) {
     ISDM_LOG(debug) << "[node] subscribe object_id=" << object_id;
-    std::lock_guard<std::mutex> lock(callback_mutex_);
-    by_object_.emplace_back(object_id, std::move(cb));
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        by_object_.emplace_back(object_id, std::move(cb));
+    }
+    // Object-level filtering cannot be expressed at the publisher; ask for all
+    // data types and let the local callback filter by ObjectId.
+    broadcast_subscription_update();
 }
 
 void Node::set_peer_state_callback(PeerStateCallback cb) {
@@ -1297,7 +1486,9 @@ void Node::maybe_push_schemas() {
     }
     for (const auto& endpoint : targets) {
         push_schemas_to(endpoint);
+        push_subscription_to(endpoint);
     }
+    cleanup_peer_subscriptions();
 }
 
 void Node::push_schemas_to(const transport::Endpoint& peer_endpoint) {
@@ -1388,6 +1579,8 @@ void Node::dispatch_frame(DataView frame_bytes, const transport::Endpoint& sourc
         handle_command_payload(frame.payload, frame.header.schema_id, source);
     } else if (frame.header.message_type == protocol::MessageType::kCommandAck) {
         handle_command_ack(frame.payload);
+    } else if (frame.header.message_type == protocol::MessageType::kSubscription) {
+        handle_subscription_update(frame.payload, source);
     } else {
         ISDM_LOG_TIME(warning, 1000)
             << "[protocol] unknown message_type="
@@ -1485,8 +1678,11 @@ void Node::log_decode_failure(const char* operation, ObjectId object_id, TypeId 
 void Node::subscribe_schema_aware(TypeId type_id, SchemaCallback cb) {
     ISDM_LOG(debug) << "[node] subscribe schema-aware type_id=" << type_id;
     delta_enabled_.store(true, std::memory_order_release);
-    std::lock_guard<std::mutex> lock(callback_mutex_);
-    by_type_schema_.emplace_back(type_id, std::move(cb));
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        by_type_schema_.emplace_back(type_id, std::move(cb));
+    }
+    broadcast_subscription_update();
 }
 
 bool Node::typed_schema_ok(const ReflectedType& local, const IncomingObject& in) {
@@ -1564,7 +1760,8 @@ bool Node::publish_encoded(ObjectId object_id, TypeId type_id, DataView data, Ti
 
     retain(message.object_id, message.type_id, schema_id, data.data(), data.size(),
            message.timestamp);
-    return send_frame_to_peers(DataView(frame_storage, frame_writer.offset()));
+    return send_data_frame_to_peers(DataView(frame_storage, frame_writer.offset()),
+                                    type_id);
 }
 
 bool Node::send_frame_to_peers(DataView frame) {

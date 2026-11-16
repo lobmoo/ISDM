@@ -39,6 +39,10 @@ public:
     // Freezes a copy of all current objects of one type for a snapshot send.
     std::vector<ObjectState> snapshot(TypeId type_id) const;
 
+    // Copies every retained object. Used by for_each_object() so callbacks can
+    // run without holding the store lock.
+    std::vector<ObjectState> snapshot_all() const;
+
     std::size_t size() const;
     std::size_t bytes() const;
 
