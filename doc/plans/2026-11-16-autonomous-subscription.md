@@ -1,7 +1,7 @@
 # 自治订阅设计（M8）
 
-> 日期：2026-11-16  
-> 分支：`feature/autonomous-subscription`（基于 `dev`）  
+> 日期：2026-11-16
+> 分支：`feature/autonomous-subscription`（基于 `dev`）
 > 目标：publisher 只管发布，subscriber 自己发现模型/对象并按需订阅。
 
 ## 背景
