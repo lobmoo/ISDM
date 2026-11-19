@@ -45,10 +45,13 @@ ctest --test-dir build --output-on-failure
 # 运行端到端 Demo
 ./build/examples/isdm_demo_pub_sub
 ./build/examples/isdm_demo_complex_types
-./build/examples/isdm_demo_type_discovery
 ./build/examples/isdm_demo_events
 ./build/examples/isdm_demo_commands
 ./build/examples/isdm_demo_autonomous_subscriber
+
+# 类型发现 Demo：两个终端分别运行
+./build/examples/isdm_demo_type_discovery pub
+./build/examples/isdm_demo_type_discovery sub
 
 # 安装（可选）
 cmake --install build

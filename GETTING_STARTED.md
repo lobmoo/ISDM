@@ -336,11 +336,15 @@ subscriber.subscribe_by_name_dynamic("Temperature",
 const isdm::TypeId id = subscriber.find_type_id_by_name("Motor");
 ```
 
-运行示例：
+运行示例（两个终端）：
 
 ```bash
-./build/examples/isdm_demo_type_discovery
-# 期望：discovered_types=2 all_objects=2 by_name_temperature=1
+# 终端 1：publisher
+./build/examples/isdm_demo_type_discovery pub
+
+# 终端 2：subscriber
+./build/examples/isdm_demo_type_discovery sub
+# 期望：扫描 5 个模型、5 个对象，按模型名订阅后打印 live 数据
 ```
 
 ### 6.7 事件与时间语义
