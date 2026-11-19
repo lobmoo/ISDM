@@ -215,7 +215,7 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 | 按类型名 | `subscribe_by_name_dynamic("Motor", cb)` | 类型名（全名或短名） | 对应类型的 `DynamicObject` |
 | 动态转强类型 | `obj.as_typed<T>()` | 回调内的 `DynamicObject` | `std::shared_ptr<T>` |
 
-`simple_pub_sub` 演示了第三种：订阅端不定义 `Motor`，而是用自动同步到的 schema 解析字段。
+`basic_pub_sub` 演示了第三种：订阅端不定义 `Motor`，而是用自动同步到的 schema 解析字段。
 `type_discovery` 演示了后几种：订阅端不引用业务结构体，按类型名/通配方式消费，并可按短名转回强类型。
 
 类型发现相关 API：
@@ -298,7 +298,7 @@ subscriber.set_event_watermark_callback([](TypeId type_id, Timestamp watermark) 
 - replay 只由**本地发布过该事件**的节点提供，中继节点不重放自己收到的事件，避免 source 变化导致去重失效。
 - replay 仍是 UDP best-effort，没有 ACK；没有 exactly-once。
 - watermark 是“已观察最大 source timestamp - lateness”的进度信号，不是完整性保证，也不处理跨节点时钟偏差。
-- 新增 `examples/events`，演示晚加入 replay、live 事件和 watermark。
+- 新增 `examples/event_replay`，演示晚加入 replay、live 事件和 watermark。
 
 #### 命令语义（Command / ACK）
 

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 add_executable(isdm_demo_pub_sub
-    simple_pub_sub/main.cc
+    basic_pub_sub/main.cc
 )
 
 target_link_libraries(isdm_demo_pub_sub PRIVATE ISDM::core)
@@ -28,7 +28,7 @@ target_compile_options(isdm_demo_type_discovery PRIVATE -Wall -Wextra -Wpedantic
 
 # Events: late subscriber replay + live events + watermark.
 add_executable(isdm_demo_events
-    events/main.cc
+    event_replay/main.cc
 )
 
 target_link_libraries(isdm_demo_events PRIVATE ISDM::core)
@@ -37,7 +37,7 @@ target_compile_options(isdm_demo_events PRIVATE -Wall -Wextra -Wpedantic)
 
 # Commands: directed command with ACK/NACK and retry/timeout.
 add_executable(isdm_demo_commands
-    commands/main.cc
+    command_ack/main.cc
 )
 
 target_link_libraries(isdm_demo_commands PRIVATE ISDM::core)
@@ -46,7 +46,7 @@ target_compile_options(isdm_demo_commands PRIVATE -Wall -Wextra -Wpedantic)
 
 # Autonomous subscriber: scan models/objects, then subscribe by name.
 add_executable(isdm_demo_autonomous_subscriber
-    autonomous_subscriber/main.cc
+    autonomous_scan/main.cc
 )
 
 target_link_libraries(isdm_demo_autonomous_subscriber PRIVATE ISDM::core)
@@ -54,7 +54,7 @@ target_compile_features(isdm_demo_autonomous_subscriber PRIVATE cxx_std_17)
 target_compile_options(isdm_demo_autonomous_subscriber PRIVATE -Wall -Wextra -Wpedantic)
 
 # Two-process ID demo: one executable, pub/sub roles, TypeId-based APIs.
-add_executable(isdm_demo_two_process two_process/main.cc)
+add_executable(isdm_demo_two_process type_id_pub_sub/main.cc)
 target_link_libraries(isdm_demo_two_process PRIVATE ISDM::core)
 target_compile_features(isdm_demo_two_process PRIVATE cxx_std_17)
 target_compile_options(isdm_demo_two_process PRIVATE -Wall -Wextra -Wpedantic)

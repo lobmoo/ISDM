@@ -1005,7 +1005,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - [ ] **Step 1: Write the demo**
 
-`examples/complex_types/main.cc`: two nodes in one process (same pattern as `examples/simple_pub_sub/main.cc`), with `ISDM_STRUCT` at global scope, `Motor` in a namespace, and both typed and dynamic subscribers. Print:
+`examples/complex_types/main.cc`: two nodes in one process (same pattern as `examples/basic_pub_sub/main.cc`), with `ISDM_STRUCT` at global scope, `Motor` in a namespace, and both typed and dynamic subscribers. Print:
 ```text
 [subscriber] typed: id=1 position=(1,2,3) waveform=3 name=motor-1
 [subscriber] dynamic: position.y=2 waveform.count=3 name=motor-1

@@ -151,7 +151,7 @@ event_watermark_lateness = 100ms;
 
 ## Example
 
-`examples/events/main.cc`：
+`examples/event_replay/main.cc`：
 
 - publisher 周期性发布 info/warning 事件；
 - subscriber 用 dynamic + typed 订阅；
@@ -168,7 +168,7 @@ event_watermark_lateness = 100ms;
 
 - 已实现 Event wire、EventStore、Node Event API、replay、source/receive timestamp、per-TypeId watermark。
 - 新增 13 个测试；总数 199/199。
-- `examples/events`：晚加入 replay 3 条 + live 1 条 + watermark。
+- `examples/event_replay`：晚加入 replay 3 条 + live 1 条 + watermark。
 - 已知限制：
   - replay 只由本地发布过该事件的节点提供；中继节点不重放收到的事件。
   - 事件历史被驱逐后无法 replay；replay 请求没有 ACK/End 标记。

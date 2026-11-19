@@ -47,9 +47,13 @@ ISDM/
 │   └── scalability/                       # 扩展性测试
 │
 ├── examples/                              # 💡 示例代码
-│   ├── simple_pub_sub/                    # 简单发布订阅
-│   ├── batch_demo/                        # 批处理示例
-│   └── shm_demo/                          # 共享内存示例
+│   ├── basic_pub_sub/                     # TypeId + schema 解析
+│   ├── complex_types/                     # 嵌套/数组/vector/string
+│   ├── event_replay/                      # 事件历史/replay/watermark
+│   ├── command_ack/                       # 定向命令/ACK
+│   ├── autonomous_scan/                   # 扫描/快照/按名订阅
+│   ├── type_id_pub_sub/                   # 双进程 TypeId typed 订阅
+│   └── type_discovery/                    # 双进程按名动态订阅
 │
 ├── tools/                                 # 🔨 工具
 │   ├── schema_gen/                        # Schema代码生成

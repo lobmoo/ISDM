@@ -121,7 +121,7 @@ command_result_age = 30s;
 
 ## Example
 
-`examples/commands`：commander 向 target 发送一条 OK 命令、一条 NACK 命令、一条无 handler 命令，打印 ACK/NACK 结果。
+`examples/command_ack`：commander 向 target 发送一条 OK 命令、一条 NACK 命令、一条无 handler 命令，打印 ACK/NACK 结果。
 
 ## 已知限制
 

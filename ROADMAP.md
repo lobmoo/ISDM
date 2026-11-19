@@ -119,7 +119,7 @@ ASSERT_EQ(decoded.speed, 1500.0f);
 - [ ] `include/isdm/protocol/control/discovery.h`
 - [ ] `src/protocol/control/discovery.cc`
 - [ ] `tests/protocol/discovery_test.cc`
-- [ ] `examples/simple_pub_sub/` - 第一个可运行Demo
+- [ ] `examples/basic_pub_sub/` - 第一个可运行Demo
 
 **里程碑：第一个可运行的Demo！**
 

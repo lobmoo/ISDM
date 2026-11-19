@@ -122,7 +122,7 @@ bool request_all_snapshots();
 
 ## Example
 
-`examples/autonomous_subscriber`：
+`examples/autonomous_scan`：
 
 - publisher 注册两种类型并发布对象；
 - subscriber 晚启动；
