@@ -332,6 +332,17 @@ subscriber.subscribe_all_dynamic([](isdm::ObjectId id, const isdm::DynamicObject
 subscriber.subscribe_by_name_dynamic("Temperature",
     [](isdm::ObjectId, const isdm::DynamicObject& obj) { /* ... */ });
 
+// 按短名匹配后直接拿强类型值；返回 shared_ptr<T>，失败返回 nullptr
+subscriber.subscribe_by_name_dynamic("Motor",
+    [](isdm::ObjectId, const isdm::DynamicObject& obj) {
+        const char* name = isdm::SchemaRegistry::type_name(*obj.descriptor);
+        if (!isdm::SchemaRegistry::type_name_matches(name, "Motor")) return;
+        const auto motor = obj.as_typed<app::Motor>();
+        if (motor != nullptr) {
+            // motor->speed / motor->current；值已拷贝，可带出回调
+        }
+    });
+
 // 名字查找：全名 demo::Motor 或短名 Motor 都可以
 const isdm::TypeId id = subscriber.find_type_id_by_name("Motor");
 ```

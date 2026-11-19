@@ -68,6 +68,14 @@ PackedLayout make_packed(std::uint32_t field_count, bool include_extra,
 
 }  // namespace
 
+TEST(SchemaRegistryTest, TypeNameMatchesFullAndShortNames) {
+    EXPECT_TRUE(SchemaRegistry::type_name_matches("demo::Motor", "demo::Motor"));
+    EXPECT_TRUE(SchemaRegistry::type_name_matches("demo::Motor", "Motor"));
+    EXPECT_TRUE(SchemaRegistry::type_name_matches("Motor", "Motor"));
+    EXPECT_FALSE(SchemaRegistry::type_name_matches("demo::Motor", "Temperature"));
+    EXPECT_FALSE(SchemaRegistry::type_name_matches(nullptr, "Motor"));
+}
+
 TEST(SchemaRegistryTest, RegistersAndFindsType) {
     SchemaRegistry registry;
     auto motor = make_motor(1, 1);

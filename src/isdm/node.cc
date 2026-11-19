@@ -14,20 +14,6 @@
 #include "isdm/transport/udp_transport.h"
 
 namespace isdm {
-namespace {
-
-// Accepts either the full reflected name ("demo::Motor") or its short name
-// ("Motor"). Short names are convenient for dashboards but can be ambiguous;
-// callers that care should use the full name.
-bool type_name_matches(const char* full_name, const std::string& requested) {
-    if (full_name == nullptr) return false;
-    const std::string_view full(full_name);
-    if (full == requested) return true;
-    const auto pos = full.rfind("::");
-    return pos != std::string_view::npos && full.substr(pos + 2) == requested;
-}
-
-}  // namespace
 
 transport::Endpoint Node::data_endpoint() const noexcept {
     return data_ == nullptr ? transport::Endpoint{} : data_->local_endpoint();
@@ -351,7 +337,7 @@ TypeId Node::find_type_id_by_name(const std::string& type_name) const {
     registry_.for_each_type([&](const TypeDescriptor& descriptor) {
         if (result != 0) return;
         const char* name = SchemaRegistry::type_name(descriptor);
-        if (type_name_matches(name, type_name)) result = descriptor.type_id;
+        if (SchemaRegistry::type_name_matches(name, type_name)) result = descriptor.type_id;
     });
     return result;
 }
@@ -409,7 +395,7 @@ void Node::resolve_name_subscriptions(const TypeDescriptor& descriptor) {
     {
         std::lock_guard<std::mutex> lock(callback_mutex_);
         for (auto it = pending_by_name_.begin(); it != pending_by_name_.end();) {
-            if (type_name_matches(type_name, it->first)) {
+            if (SchemaRegistry::type_name_matches(type_name, it->first)) {
                 matched.push_back(std::move(it->second));
                 it = pending_by_name_.erase(it);
             } else {

@@ -113,19 +113,6 @@ void print_usage(const char* program) {
     LOG(info) << "  sub  scan schema/objects, then subscribe by model name";
 }
 
-// Reads one scalar field out of a dynamically decoded object. The bytes point
-// into the received payload, so the value is copied immediately.
-template <typename T>
-bool read_dynamic_field(const isdm::DynamicObject& object, const char* field_name, T& out) {
-    for (const isdm::DynamicField& field : object.fields) {
-        if (field.name == field_name && field.bytes.size() >= sizeof(T)) {
-            std::memcpy(&out, field.bytes.data(), sizeof(T));
-            return true;
-        }
-    }
-    return false;
-}
-
 int run_publisher() {
     isdm::Node publisher(make_config(301, "type-publisher"));
     if (!publisher.register_type_typed<demo::Motor>(demo::kMotorTypeId) ||
@@ -265,13 +252,17 @@ int run_subscriber() {
                               << " object_id=" << object_id
                               << " fields=" << object.fields.size();
                 }
-                if (object.type_id == demo::kMotorTypeId) {
-                    demo::Motor motor{};
-                    if (read_dynamic_field(object, "id", motor.id) &&
-                        read_dynamic_field(object, "speed", motor.speed) &&
-                        read_dynamic_field(object, "current", motor.current)) {
-                        LOG(info) << "  Motor: id=" << motor.id << " speed=" << motor.speed
-                                  << " current=" << motor.current;
+                // Match by short type name; users do not need to know TypeIds.
+                const char* type_name =
+                    object.descriptor == nullptr
+                        ? nullptr
+                        : isdm::SchemaRegistry::type_name(*object.descriptor);
+                if (isdm::SchemaRegistry::type_name_matches(type_name, "Motor")) {
+                    const auto motor = object.as_typed<demo::Motor>();
+                    if (motor != nullptr) {
+                        LOG(info) << "  Motor: id=" << motor->id
+                                  << " speed=" << motor->speed
+                                  << " current=" << motor->current;
                     }
                 }
             });

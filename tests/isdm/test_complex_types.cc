@@ -306,6 +306,59 @@ TEST(ObjectCodecTest, SkipsUnknownFieldAndZeroDefaultsMissingField) {
     EXPECT_TRUE(out.waveform.empty());
 }
 
+TEST(ObjectCodecTest, DynamicObjectAsTypedFixedRaw) {
+    const auto ref = isdm::describe<complex_test::FixedOnly>(320, 1);
+    complex_test::FixedOnly in{};
+    in.a[0] = 1.5f;
+    in.a[3] = 4.5f;
+    in.id = 42;
+
+    std::array<std::byte, 64> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    ASSERT_TRUE(ObjectCodec::encode(ref, &in, writer));
+
+    DynamicObject obj;
+    ASSERT_TRUE(ObjectCodec::decode_dynamic(ref.descriptor(),
+                                            DataView(storage.data(), writer.offset()), obj));
+    const auto out = obj.as_typed<complex_test::FixedOnly>();
+    ASSERT_NE(out, nullptr);
+    EXPECT_FLOAT_EQ(out->a[0], 1.5f);
+    EXPECT_FLOAT_EQ(out->a[3], 4.5f);
+    EXPECT_EQ(out->id, 42U);
+    EXPECT_EQ(obj.as_typed<complex_test::Position>(), nullptr);
+}
+
+TEST(ObjectCodecTest, DynamicObjectAsTypedPacked) {
+    const auto ref = isdm::describe<complex_test::ArraysAndText>(321, 2);
+    complex_test::ArraysAndText in{};
+    in.id = 7;
+    for (int i = 0; i < 8; ++i) in.samples[i] = static_cast<float>(i);
+    in.gains = {0.5f, 1.5f, 2.5f, 3.5f};
+    in.waveform = {1.0f, 2.0f, 3.0f};
+    in.name = "axis";
+
+    std::array<std::byte, 256> storage{};
+    ByteWriter writer(MutableDataView(storage.data(), storage.size()));
+    ASSERT_TRUE(ObjectCodec::encode(ref, &in, writer));
+
+    DynamicObject obj;
+    ASSERT_TRUE(ObjectCodec::decode_dynamic(ref.descriptor(),
+                                            DataView(storage.data(), writer.offset()), obj));
+    const auto out = obj.as_typed<complex_test::ArraysAndText>();
+    ASSERT_NE(out, nullptr);
+    EXPECT_EQ(out->id, 7U);
+    EXPECT_FLOAT_EQ(out->samples[7], 7.0f);
+    EXPECT_FLOAT_EQ(out->gains[3], 3.5f);
+    ASSERT_EQ(out->waveform.size(), 3U);
+    EXPECT_FLOAT_EQ(out->waveform[2], 3.0f);
+    EXPECT_EQ(out->name, "axis");
+}
+
+TEST(ObjectCodecTest, DynamicObjectAsTypedRejectsMissingDescriptor) {
+    DynamicObject obj;
+    EXPECT_EQ(obj.as_typed<complex_test::FixedOnly>(), nullptr);
+}
+
 TEST(ObjectCodecTest, DynamicEncodeZeroDefaults) {
     const auto ref = isdm::describe<complex_test::Motor>(310, 1);
     DynamicObject obj;

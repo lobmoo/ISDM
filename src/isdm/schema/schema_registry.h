@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -70,6 +71,12 @@ public:
     }
 
     static const char* type_name(const TypeDescriptor& descriptor) noexcept;
+
+    // Accepts either the full reflected name ("demo::Motor") or its short name
+    // ("Motor"). Short names are convenient for dashboards but can be
+    // ambiguous; callers that care should use the full name.
+    static bool type_name_matches(const char* full_name,
+                                  std::string_view requested) noexcept;
 
 private:
     struct Key {

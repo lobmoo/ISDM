@@ -209,9 +209,10 @@ ISDM_STRUCT(Motor, ISDM_FIELD(Motor, id), ISDM_FIELD(Motor, position),
 | 用 schema 自己解析 | `subscribe(type_id, cb)` + `registry().find(type_id)` | 只要 `TypeId` | 原始 `DataView`，应用按 `TypeDescriptor` 逐字段读 |
 | 通配动态 | `subscribe_all_dynamic(cb)` | 不需要 `TypeId` | 任意类型的 `DynamicObject` |
 | 按类型名 | `subscribe_by_name_dynamic("Motor", cb)` | 类型名（全名或短名） | 对应类型的 `DynamicObject` |
+| 动态转强类型 | `obj.as_typed<T>()` | 回调内的 `DynamicObject` | `std::shared_ptr<T>` |
 
 `simple_pub_sub` 演示了第三种：订阅端不定义 `Motor`，而是用自动同步到的 schema 解析字段。
-`type_discovery` 演示了后两种：订阅端不引用业务结构体，按类型名/通配方式消费。
+`type_discovery` 演示了后几种：订阅端不引用业务结构体，按类型名/通配方式消费，并可按短名转回强类型。
 
 类型发现相关 API：
 
@@ -223,6 +224,14 @@ subscriber.set_type_discovered_callback([](const TypeDescriptor& desc) {
 const TypeId id = subscriber.find_type_id_by_name("Motor");  // 未知返回 0
 subscriber.subscribe_by_name_dynamic("Motor", [](ObjectId, const DynamicObject& obj) {
     // schema 未到达时先挂起，到达后自动激活
+    // 按短名匹配，拿到强类型值（智能指针，值已拷贝，可带出回调）
+    if (SchemaRegistry::type_name_matches(
+            SchemaRegistry::type_name(*obj.descriptor), "Motor")) {
+        const auto motor = obj.as_typed<Motor>();
+        if (motor != nullptr) {
+            // motor->id / motor->speed / motor->current
+        }
+    }
 });
 ```
 
@@ -233,6 +242,7 @@ subscriber.subscribe_by_name_dynamic("Motor", [](ObjectId, const DynamicObject& 
 - `subscribe_typed` / `subscribe_dynamic` / 通配回调不带 timestamp/source；需要时间信息时走 raw `subscribe` 的 `DataCallback`。
 - 如果发布端用原始 `publish()` 且没有注册 schema，数据就只是字节；自描述的前提是发布端注册了 schema。
 - 类型名匹配支持 `demo::Motor` 全名或 `Motor` 短名；短名有歧义时取第一个匹配的 TypeId。
+- `obj.as_typed<T>()` 返回 `std::shared_ptr<T>`；类型名不匹配或字段解码失败时返回 `nullptr`。`DynamicObject` 的字段视图只在回调内有效，`as_typed` 返回的是已拷贝的独立值。
 
 #### 快照语义
 

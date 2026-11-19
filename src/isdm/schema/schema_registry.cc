@@ -250,4 +250,13 @@ const char* SchemaRegistry::type_name(const TypeDescriptor& descriptor) noexcept
                                             : descriptor.name_table + descriptor.name_offset;
 }
 
+bool SchemaRegistry::type_name_matches(const char* full_name,
+                                       std::string_view requested) noexcept {
+    if (full_name == nullptr) return false;
+    const std::string_view full(full_name);
+    if (full == requested) return true;
+    const auto pos = full.rfind("::");
+    return pos != std::string_view::npos && full.substr(pos + 2) == requested;
+}
+
 }  // namespace isdm
