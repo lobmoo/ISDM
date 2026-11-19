@@ -53,6 +53,10 @@ ctest --test-dir build --output-on-failure
 ./build/examples/isdm_demo_type_discovery pub
 ./build/examples/isdm_demo_type_discovery sub
 
+# 按 TypeId 的双进程 Demo：两个终端分别运行
+./build/examples/isdm_demo_two_process pub
+./build/examples/isdm_demo_two_process sub
+
 # 安装（可选）
 cmake --install build
 ```

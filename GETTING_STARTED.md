@@ -457,6 +457,21 @@ publisher 会按 subscriber 上报的兴趣集合，只发送匹配 TypeId 的 d
 # 期望：扫描到 Motor/Temperature 模型、3 个对象，temperature_objects=2
 ```
 
+### 6.10 按 TypeId 的双进程示例
+
+`two_process` 与 `type_discovery` 使用同一套 5 个模型，但订阅端采用 ID 方式：它知道 TypeId 和 C++ 结构，按 TypeId 做 typed 订阅。ID 注册/解析路径仍然保留，适合不使用运行时名字发现的部署。
+
+```bash
+# 终端 1
+./build/examples/isdm_demo_two_process pub
+
+# 终端 2
+./build/examples/isdm_demo_two_process sub
+# 期望：扫描 5 个模型、5 个对象，5 类 live 数据持续输出
+```
+
+两个进程都支持 Ctrl-C 优雅退出；组播组为 `239.255.20.100:40000`，与 `type_discovery` 的 `40005` 隔离，可同时运行。
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。
