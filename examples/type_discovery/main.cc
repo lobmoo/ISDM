@@ -13,8 +13,8 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
+#include <iomanip>
 #include <map>
 #include <mutex>
 #include <string>
@@ -108,9 +108,9 @@ isdm::NodeConfig make_config(isdm::NodeId node_id, const char* name) {
 }
 
 void print_usage(const char* program) {
-    std::printf("usage: %s pub|sub\n", program);
-    std::printf("  pub  publish Motor/Temperature/RobotPose/Alarm/SensorHealth\n");
-    std::printf("  sub  scan schema/objects, then subscribe by model name\n");
+    LOG(info) << "usage: " << program << " pub|sub";
+    LOG(info) << "  pub  publish Motor/Temperature/RobotPose/Alarm/SensorHealth";
+    LOG(info) << "  sub  scan schema/objects, then subscribe by model name";
 }
 
 int run_publisher() {
@@ -120,15 +120,15 @@ int run_publisher() {
         !publisher.register_type_typed<demo::RobotPose>(demo::kRobotPoseTypeId) ||
         !publisher.register_type_typed<demo::Alarm>(demo::kAlarmTypeId) ||
         !publisher.register_type_typed<demo::SensorHealth>(demo::kHealthTypeId)) {
-        std::printf("!! failed to register models\n");
+        LOG(error) << "failed to register models";
         return 1;
     }
     if (!publisher.start()) {
-        std::printf("!! publisher failed to start\n");
+        LOG(error) << "publisher failed to start";
         return 1;
     }
 
-    std::printf("[publisher] started; 5 models registered. Ctrl-C to stop.\n");
+    LOG(info) << "publisher started; 5 models registered. Ctrl-C to stop.";
     int tick = 0;
     while (g_running.load()) {
         ++tick;
@@ -148,15 +148,14 @@ int run_publisher() {
                                 demo::SensorHealth{5, static_cast<std::uint8_t>(tick % 3),
                                                    static_cast<std::uint16_t>(tick % 7)});
         if (tick % 25 == 1) {
-            std::printf("[publisher] tick=%d peers=%zu metrics_tx_frames=%llu\n", tick,
-                        publisher.peers().size(),
-                        static_cast<unsigned long long>(
-                            publisher.metrics().tx_frames.load()));
+            LOG(info) << "publisher tick=" << tick << " peers="
+                      << publisher.peers().size() << " metrics_tx_frames="
+                      << publisher.metrics().tx_frames.load();
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     publisher.stop();
-    std::printf("[publisher] stopped\n");
+    LOG(info) << "publisher stopped";
     return 0;
 }
 
@@ -164,13 +163,14 @@ int run_subscriber() {
     isdm::Node subscriber(make_config(302, "type-subscriber"));
     subscriber.set_type_discovered_callback([](const isdm::TypeDescriptor& descriptor) {
         const char* name = isdm::SchemaRegistry::type_name(descriptor);
-        std::printf("[subscriber] schema arrived: %s type_id=%u fields=%u layout=%s\n",
-                    name == nullptr ? "(unnamed)" : name, descriptor.type_id,
-                    descriptor.field_count,
-                    descriptor.layout == isdm::TypeLayout::kPacked ? "packed" : "fixed");
+        LOG(info) << "schema arrived: " << (name == nullptr ? "(unnamed)" : name)
+                  << " type_id=" << descriptor.type_id
+                  << " fields=" << descriptor.field_count
+                  << " layout="
+                  << (descriptor.layout == isdm::TypeLayout::kPacked ? "packed" : "fixed");
     });
     if (!subscriber.start()) {
-        std::printf("!! subscriber failed to start\n");
+        LOG(error) << "subscriber failed to start";
         return 1;
     }
 
@@ -180,7 +180,7 @@ int run_subscriber() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     if (!peers_ready) {
-        std::printf("!! discovery timed out; start the publisher first\n");
+        LOG(error) << "discovery timed out; start the publisher first";
         subscriber.stop();
         return 1;
     }
@@ -199,21 +199,22 @@ int run_subscriber() {
         if (!schema_ready) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     if (!schema_ready) {
-        std::printf("!! schema sync timed out\n");
+        LOG(error) << "schema sync timed out";
         subscriber.stop();
         return 1;
     }
 
-    std::printf("\n[subscriber] model scan:\n");
+    LOG(info) << "model scan:";
     std::vector<std::string> model_names;
     subscriber.registry().for_each_type([&](const isdm::TypeDescriptor& descriptor) {
         const char* name = isdm::SchemaRegistry::type_name(descriptor);
         std::string display = name == nullptr ? "(unnamed)" : name;
         model_names.push_back(display);
-        std::printf("  %-24s type_id=%u version=%u fields=%u layout=%s\n",
-                    display.c_str(), descriptor.type_id, descriptor.version,
-                    descriptor.field_count,
-                    descriptor.layout == isdm::TypeLayout::kPacked ? "packed" : "fixed");
+        LOG(info) << "  " << std::left << std::setw(24) << display
+                  << " type_id=" << descriptor.type_id
+                  << " version=" << descriptor.version
+                  << " fields=" << descriptor.field_count << " layout="
+                  << (descriptor.layout == isdm::TypeLayout::kPacked ? "packed" : "fixed");
     });
 
     subscriber.request_all_snapshots();
@@ -223,15 +224,16 @@ int run_subscriber() {
         if (count >= 5) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    std::printf("\n[subscriber] object scan:\n");
+    LOG(info) << "object scan:";
     subscriber.for_each_object([&](const isdm::ObjectState& state) {
         const isdm::TypeDescriptor* descriptor = subscriber.registry().find(state.type_id);
         const char* name =
             descriptor == nullptr ? "(unknown)" : isdm::SchemaRegistry::type_name(*descriptor);
-        std::printf("  type=%-24s type_id=%u object_id=%llu timestamp=%lld bytes=%zu\n",
-                    name == nullptr ? "(unnamed)" : name, state.type_id,
-                    static_cast<unsigned long long>(state.object_id),
-                    static_cast<long long>(state.timestamp), state.payload.size());
+        LOG(info) << "  type=" << std::left << std::setw(24)
+                  << (name == nullptr ? "(unnamed)" : name)
+                  << " type_id=" << state.type_id << " object_id=" << state.object_id
+                  << " timestamp=" << state.timestamp
+                  << " bytes=" << state.payload.size();
     });
 
     // Scan -> on-demand subscription by model name.
@@ -246,30 +248,28 @@ int run_subscriber() {
                 int& count = live_counts[object.type_id];
                 ++count;
                 if (count <= 3) {
-                    std::printf("[subscriber] live %-24s object_id=%llu fields=%zu\n",
-                                name.c_str(),
-                                static_cast<unsigned long long>(object_id),
-                                object.fields.size());
+                    LOG(info) << "live " << std::left << std::setw(24) << name
+                              << " object_id=" << object_id
+                              << " fields=" << object.fields.size();
                 }
             });
         if (ok) ++subscribed;
     }
-    std::printf("\n[subscriber] subscribed by name: %zu models. Ctrl-C to stop.\n",
-                subscribed);
+    LOG(info) << "subscribed by name: " << subscribed << " models. Ctrl-C to stop.";
 
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    std::printf("\n[subscriber] live counts:\n");
+    LOG(info) << "live counts:";
     {
         std::lock_guard<std::mutex> lock(print_mutex);
         for (const auto& [type_id, count] : live_counts) {
-            std::printf("  type_id=%u count=%d\n", type_id, count);
+            LOG(info) << "  type_id=" << type_id << " count=" << count;
         }
     }
     subscriber.stop();
-    std::printf("[subscriber] stopped\n");
+    LOG(info) << "subscriber stopped";
     return 0;
 }
 
