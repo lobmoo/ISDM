@@ -206,6 +206,7 @@ int run_subscriber() {
 
     LOG(info) << "model scan:";
     std::vector<std::string> model_names;
+    //扫描一次更可靠，这里是所有模型，再回调里拿可能不全
     subscriber.registry().for_each_type([&](const isdm::TypeDescriptor& descriptor) {
         const char* name = isdm::SchemaRegistry::type_name(descriptor);
         std::string display = name == nullptr ? "(unnamed)" : name;
