@@ -472,6 +472,35 @@ publisher 会按 subscriber 上报的兴趣集合，只发送匹配 TypeId 的 d
 
 两个进程都支持 Ctrl-C 优雅退出；组播组为 `239.255.20.100:40000`，与 `type_discovery` 的 `40005` 隔离，可同时运行。
 
+### 6.11 整块内存与叶子字段收发
+
+`memory_leaf` 演示同一个 fixed-raw 对象的四种收发方式：
+
+```bash
+./build/examples/isdm_demo_memory_leaf
+# 期望：整块发布/叶子发布各一次，整块接收/叶子接收数值一致
+```
+
+```cpp
+// 整块内存发布
+publisher.publish(1, kMotorTypeId, isdm::DataView(&motor, sizeof(motor)));
+
+// 整块内存接收
+subscriber.subscribe(kMotorTypeId, [](isdm::ObjectId, isdm::TypeId type_id,
+                                      isdm::DataView payload, isdm::Timestamp) {
+    Motor got{};
+    std::memcpy(&got, payload.data(), sizeof(got));
+});
+
+// 按叶子接收
+const auto* desc = subscriber.registry().find(type_id);
+const float speed = payload.read_at<float>(desc->fields[1].offset);
+
+// 按叶子发布：DynamicObject + publish_dynamic
+```
+
+注意：整块内存方式只适用于 fixed-raw 类型；含 `std::string`/`std::vector` 的类型必须走 packed 编码。
+
 ## 7. 关键概念
 
 - **Schema 与数据分离**：实时数据帧只带 TypeId/ObjectId，结构定义通过发现阶段同步。

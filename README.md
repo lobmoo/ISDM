@@ -44,6 +44,7 @@ ctest --test-dir build --output-on-failure
 
 # 运行端到端 Demo
 ./build/examples/isdm_demo_pub_sub
+./build/examples/isdm_demo_memory_leaf
 ./build/examples/isdm_demo_complex_types
 ./build/examples/isdm_demo_events
 ./build/examples/isdm_demo_commands

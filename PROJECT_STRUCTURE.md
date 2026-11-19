@@ -48,6 +48,7 @@ ISDM/
 │
 ├── examples/                              # 💡 示例代码
 │   ├── basic_pub_sub/                     # TypeId + schema 解析
+│   ├── memory_leaf/                       # 整块内存/叶子字段收发
 │   ├── complex_types/                     # 嵌套/数组/vector/string
 │   ├── event_replay/                      # 事件历史/replay/watermark
 │   ├── command_ack/                       # 定向命令/ACK

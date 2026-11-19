@@ -8,6 +8,12 @@ target_link_libraries(isdm_demo_pub_sub PRIVATE ISDM::core)
 target_compile_features(isdm_demo_pub_sub PRIVATE cxx_std_17)
 target_compile_options(isdm_demo_pub_sub PRIVATE -Wall -Wextra -Wpedantic)
 
+# Memory/leaf: whole-memory publish/receive and leaf-level access.
+add_executable(isdm_demo_memory_leaf memory_leaf/main.cc)
+target_link_libraries(isdm_demo_memory_leaf PRIVATE ISDM::core)
+target_compile_features(isdm_demo_memory_leaf PRIVATE cxx_std_17)
+target_compile_options(isdm_demo_memory_leaf PRIVATE -Wall -Wextra -Wpedantic)
+
 # Complex types: nested struct, fixed array, sequence, and string.
 add_executable(isdm_demo_complex_types
     complex_types/main.cc

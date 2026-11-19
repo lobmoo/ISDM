@@ -67,7 +67,7 @@ mkdir -p include/isdm/{core/{type,schema,object,api},runtime/{memory,batch,delta
 mkdir -p src/{core/{type,schema,object,api},runtime/{memory,batch,delta},protocol/{control,data,codec},transport/{udp,tcp,shm},util}
 mkdir -p tests/{core,runtime,protocol,transport,integration}
 mkdir -p benchmarks/{throughput,latency,scalability}
-mkdir -p examples/{basic_pub_sub,complex_types,event_replay,command_ack,autonomous_scan,type_id_pub_sub,type_discovery}
+mkdir -p examples/{basic_pub_sub,memory_leaf,complex_types,event_replay,command_ack,autonomous_scan,type_id_pub_sub,type_discovery}
 mkdir -p doc
 mkdir -p tools/{schema_gen,cli}
 
