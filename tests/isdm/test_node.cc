@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 #include <gtest/gtest.h>
@@ -316,6 +317,112 @@ TEST(NodeDeltaTest, SubscriberAppliesDeltaToFullValue) {
     EXPECT_GE(updates.load(), 2);
     EXPECT_EQ(got.id, 1u);
     EXPECT_FLOAT_EQ(got.speed, 200.0f);
+}
+
+TEST(NodeMemoryTest, WholeAndLeafPublishReceive) {
+    const transport::Endpoint group(239, 255, 10, 14, 39308);
+    constexpr TypeId kTypeId = 650;
+
+    Node publisher(make_config(1, "publisher", group));
+    ASSERT_TRUE(publisher.register_type_typed<typed_test::Motor>(kTypeId));
+    ASSERT_TRUE(publisher.start());
+
+    Node subscriber(make_config(2, "subscriber", group));
+    ASSERT_TRUE(subscriber.start());
+
+    std::mutex mutex;
+    std::atomic<int> received{0};
+    std::uint32_t leaf_id = 0;
+    float leaf_speed = 0.0f;
+    std::uint32_t memory_id = 0;
+    float memory_speed = 0.0f;
+
+    // One raw callback exercises both receive styles:
+    // - leaf access through descriptor offsets
+    // - whole-object access through a memcpy of the fixed-raw payload
+    subscriber.subscribe(kTypeId, [&](ObjectId, TypeId type_id, DataView payload,
+                                      Timestamp) {
+        const TypeDescriptor* descriptor = subscriber.registry().find(type_id);
+        if (descriptor == nullptr || descriptor->field_count < 2) return;
+
+        const std::uint32_t by_leaf =
+            payload.read_at<std::uint32_t>(descriptor->fields[0].offset);
+        const float speed_by_leaf =
+            payload.read_at<float>(descriptor->fields[1].offset);
+
+        typed_test::Motor by_memory{};
+        if (payload.size() == sizeof(by_memory)) {
+            std::memcpy(&by_memory, payload.data(), sizeof(by_memory));
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        leaf_id = by_leaf;
+        leaf_speed = speed_by_leaf;
+        memory_id = by_memory.id;
+        memory_speed = by_memory.speed;
+        ++received;
+    });
+
+    for (int i = 0; i < 400 && subscriber.registry().find(kTypeId) == nullptr; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_NE(subscriber.registry().find(kTypeId), nullptr);
+
+    // Whole-object memory publish -> whole-memory and leaf receive.
+    const typed_test::Motor whole{11, 22.5f};
+    ASSERT_TRUE(publisher.publish(1, kTypeId, DataView(&whole, sizeof(whole))));
+    for (int i = 0; i < 400 && received.load() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_GE(received.load(), 1);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        EXPECT_EQ(leaf_id, 11U);
+        EXPECT_FLOAT_EQ(leaf_speed, 22.5f);
+        EXPECT_EQ(memory_id, 11U);
+        EXPECT_FLOAT_EQ(memory_speed, 22.5f);
+    }
+
+    // Leaf-by-leaf publish -> whole-memory and leaf receive.
+    const TypeDescriptor* descriptor = publisher.registry().find(kTypeId);
+    ASSERT_NE(descriptor, nullptr);
+    ASSERT_EQ(descriptor->field_count, 2U);
+
+    const std::uint32_t leaf_id_out = 77;
+    const float leaf_speed_out = 88.5f;
+    DynamicObject leaf_object;
+    leaf_object.type_id = kTypeId;
+    leaf_object.version = descriptor->version;
+    leaf_object.descriptor = descriptor;
+
+    DynamicField id_field;
+    id_field.field_id = descriptor->fields[0].field_id;
+    id_field.name = descriptor->name_table + descriptor->fields[0].name_offset;
+    id_field.bytes = DataView(&leaf_id_out, sizeof(leaf_id_out));
+
+    DynamicField speed_field;
+    speed_field.field_id = descriptor->fields[1].field_id;
+    speed_field.name = descriptor->name_table + descriptor->fields[1].name_offset;
+    speed_field.bytes = DataView(&leaf_speed_out, sizeof(leaf_speed_out));
+
+    leaf_object.fields.push_back(id_field);
+    leaf_object.fields.push_back(speed_field);
+
+    ASSERT_TRUE(publisher.publish_dynamic(2, kTypeId, leaf_object));
+    for (int i = 0; i < 400 && received.load() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_GE(received.load(), 2);
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        EXPECT_EQ(leaf_id, 77U);
+        EXPECT_FLOAT_EQ(leaf_speed, 88.5f);
+        EXPECT_EQ(memory_id, 77U);
+        EXPECT_FLOAT_EQ(memory_speed, 88.5f);
+    }
+
+    publisher.stop();
+    subscriber.stop();
 }
 
 }  // namespace isdm::test
